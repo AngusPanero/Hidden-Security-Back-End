@@ -2,7 +2,7 @@ const rateLimit = require("express-rate-limit")
 
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 min
-    max: 10, // limite por ip
+    max: 50, // limite por ip
     standardHeaders: true,
     legacyHeaders: false,
     message: {

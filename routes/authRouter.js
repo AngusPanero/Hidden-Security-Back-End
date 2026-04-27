@@ -102,20 +102,75 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
         });
 
     } catch (error) {
-        const errorCode = error.response?.data?.error?.message;
+        const errorData = error.response?.data?.error?.message;
         
-        if (
-            errorCode === "INVALID_PASSWORD" || 
-            errorCode === "EMAIL_NOT_FOUND" || 
-            errorCode === "INVALID_LOGIN_CREDENTIALS"
-        ) {
-            return res.status(401).json({ code: "auth/invalid-credential" });
+        // Limpiamos el error por si viene con texto extra (ej: "INVALID_PASSWORD : ...")
+        const errorCode = errorData ? errorData.split(' ')[0] : null;
+        const now = Date.now();
+
+        console.log("DEBUG // Error detectado:", errorCode);
+
+        // 2. Definimos los errores que disparan la auditoría
+        const loginErrors = ["INVALID_PASSWORD", "EMAIL_NOT_FOUND", "INVALID_LOGIN_CREDENTIALS"];
+
+        if (loginErrors.includes(errorCode)) {
+            try {
+                // USAMOS REQ.BODY.EMAIL directamente para asegurar que existe en este scope
+                const userEmail = req.body.email;
+
+                console.log(`INFO // Colección destino: ${Audit.collection.name}`); // <--- AGREGA ESTO
+                console.log(`INFO // Base de datos destino: ${Audit.db.name}`);
+
+                const attempt = await Audit.findOneAndUpdate(
+                    { email: userEmail, event: "login-failed" },
+                    { 
+                        $inc: { attempts: 1 }, 
+                        $set: { lastAttemptAt: now } 
+                    },
+                    { upsert: true, returnDocument: 'after' }
+                );
+
+                console.log(`AUDIT // Fallo registrado para ${userEmail}. Intento: ${attempt.attempts}`);
+
+                if (attempt.attempts >= 5) {
+                    try {
+                        const userRecord = await auth.getUserByEmail(userEmail);
+                        await auth.setCustomUserClaims(userRecord.uid, {
+                            banned: true,
+                            bannedAt: now,
+                            bannedReason: "Too many failed login attempts"
+                        });
+                        await auth.revokeRefreshTokens(userRecord.uid);
+                        
+                        return res.status(401).json({ 
+                            code: "auth/too-many-attempts", 
+                            banned: true 
+                        });
+                    } catch (getUserError) {
+                        // El email no existe en Firebase, pero ya auditamos el intento
+                        return res.status(401).json({ 
+                            code: "auth/invalid-credential", 
+                            attempts: attempt.attempts 
+                        });
+                    }
+                }
+
+                return res.status(401).json({ 
+                    code: "auth/invalid-credential", 
+                    attempts: attempt.attempts 
+                });
+
+            } catch (dbError) {
+                console.error("DB_AUDIT_CRITICAL_ERROR 🔴", dbError);
+                return res.status(401).json({ code: "auth/invalid-credential" });
+            }
         }
         
-        console.error(esProduccion ? "Login Error" :"Login Error:", errorCode || error.message);
+        // 3. Si el error NO es de credenciales (ej: error de red, API key inválida)
+        console.error("SYSTEM_LOGIN_ERROR 🔴", errorCode || error.message);
         return res.status(500).json({ message: "Internal Server Error" });
     }
-});
+})
 
 authRouter.post("/logout", async (req, res) => {
     const idToken = req.cookies.idToken;
@@ -179,7 +234,7 @@ authRouter.post("/logout", async (req, res) => {
                 bannedAt: now,
                 bannedReason: "Too many failed login attempts"
             })
-            await auth.revokeRefreshTokens(user.uid)
+            await auth.revokeRefreshTokens(user.uid) 
             return res.status(200).json({ message: "User banned due to too many failed attempts! 🔴", banned: true })
         }
         return res.status(200).json({ message: "Failed login attempt recorded! 🟡", attempts: attempt.attempts })
