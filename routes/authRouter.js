@@ -81,7 +81,7 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
             httpOnly: true,
             sameSite: "lax",
             secure: true,
-            domain: ".deepdev.com.ar",
+            domain: "https://deepdev-back.ngrok-free.app",
             maxAge: 60 * 60 * 1000,
             path: "/"
         }); */
@@ -118,9 +118,6 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
                 // USAMOS REQ.BODY.EMAIL directamente para asegurar que existe en este scope
                 const userEmail = req.body.email;
 
-                console.log(`INFO // Colección destino: ${Audit.collection.name}`); // <--- AGREGA ESTO
-                console.log(`INFO // Base de datos destino: ${Audit.db.name}`);
-
                 const attempt = await Audit.findOneAndUpdate(
                     { email: userEmail, event: "login-failed" },
                     { 
@@ -129,8 +126,6 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
                     },
                     { upsert: true, returnDocument: 'after' }
                 );
-
-                console.log(`AUDIT // Fallo registrado para ${userEmail}. Intento: ${attempt.attempts}`);
 
                 if (attempt.attempts >= 5) {
                     try {
@@ -191,7 +186,7 @@ authRouter.post("/logout", async (req, res) => {
             httpOnly: true,
             sameSite: "lax",
             secure: true,
-            domain: ".deepdev.com.ar",
+            domain: "https://deepdev-back.ngrok-free.app",
             path: "/" 
         }); */
 

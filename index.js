@@ -24,7 +24,7 @@ app.use(cookieParser())
 dbConnection()
 
 app.use(cors({
-    origin: ["http://192.168.1.124:5173", `${process.env.API_BACKEND_URL}`, `${process.env.FRONT_END}`, `${process.env.FRONT_END_WWW}`, `${process.env.LOCAL_HOST}`].filter(Boolean),
+    origin: [ `${process.env.LOCAL_LINK}`, `${process.env.LOCAL_HOST_MOBILE}`, `${process.env.API_BACKEND_URL}`, `${process.env.FRONT_END}`, `${process.env.FRONT_END_WWW}`, `${process.env.LOCAL_HOST}`].filter(Boolean),
     methods: [ "GET", "POST", "PUT", "PATCH", "DELETE" ],
     credentials: true,
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
