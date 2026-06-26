@@ -27,7 +27,7 @@ const createTransporter = () => nodemailer.createTransport({
 
 // ─── Helper: enviar email de verificación ─────────────────────────────────────
 async function sendVerificationEmail(email) {
-    const frontendUrl = process.env.FRONT_END || process.env.LOCAL_HOST;
+    const frontendUrl = process.env.FRONT_END || process.env.LOCAL_HOST || "http://localhost:5173";
 
     // Admin SDK genera el link — no necesita idToken ni contraseña del usuario
     const link = await auth.generateEmailVerificationLink(email, {
@@ -236,7 +236,6 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
         });
 
         // 6. Configurar Cookie
-
         /* res.cookie("idToken", idToken, {
             httpOnly: true,
             sameSite: "lax",
@@ -253,11 +252,32 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
             path: "/" 
         });
 
+        // ── Objeto de usuario propio — nunca mandar decoded directo ──────────
+        const userPayload = {
+            uid:                   decoded.uid,
+            email:                 decoded.email,
+            nombre:                decoded.nombre                || null,
+            // Roles
+            admin:                 decoded.admin                 === true,
+            isEnterprise:          !!decoded.isEnterprise,
+            userCertificated:      !!decoded.userCertificated,
+            // Planes usuario normal
+            purchases:             Array.isArray(decoded.purchases) ? decoded.purchases : [],
+            purchaseExpiry:        decoded.purchaseExpiry        || {},
+            // Planes enterprise
+            enterprisePlan:        decoded.enterprisePlan        || null,
+            enterprisePlanExpiry:  decoded.enterprisePlanExpiry  || null,
+            vacancyLimit:          decoded.vacancyLimit          ?? null,
+            vacanciesUsed:         decoded.vacanciesUsed         ?? 0,
+            // Empresa
+            companyName:           decoded.companyName           || null,
+            companyLogo:           decoded.companyLogo           || null,
+        };
+
         return res.status(200).json({ 
-            user: decoded, 
-            idToken,
-            isAdmin:      decoded.admin === true,
-            isEnterprise: !!decoded.isEnterprise
+            user:        userPayload,
+            isAdmin:     userPayload.admin,
+            isEnterprise: userPayload.isEnterprise,
         });
 
     } catch (error) {
@@ -445,11 +465,29 @@ authRouter.get("/check-auth", verifyToken, async (req, res) => {
     }
     try {
         const decoded = await auth.verifyIdToken(idToken);
+
+        const userPayload = {
+            uid:                   decoded.uid,
+            email:                 decoded.email,
+            nombre:                decoded.nombre                || null,
+            admin:                 decoded.admin                 === true,
+            isEnterprise:          !!decoded.isEnterprise,
+            userCertificated:      !!decoded.userCertificated,
+            purchases:             Array.isArray(decoded.purchases) ? decoded.purchases : [],
+            purchaseExpiry:        decoded.purchaseExpiry        || {},
+            enterprisePlan:        decoded.enterprisePlan        || null,
+            enterprisePlanExpiry:  decoded.enterprisePlanExpiry  || null,
+            vacancyLimit:          decoded.vacancyLimit          ?? null,
+            vacanciesUsed:         decoded.vacanciesUsed         ?? 0,
+            companyName:           decoded.companyName           || null,
+            companyLogo:           decoded.companyLogo           || null,
+        };
+
         return res.status(200).json({ 
             authenticated: true, 
-            user: decoded,
-            isAdmin:      decoded.admin === true,
-            isEnterprise: !!decoded.isEnterprise 
+            user:        userPayload,
+            isAdmin:     userPayload.admin,
+            isEnterprise: userPayload.isEnterprise,
         });
     } catch (error) {
         return res.status(401).json({ authenticated: false });
@@ -465,7 +503,25 @@ authRouter.get("/me", verifyToken, checkBanned, async (req, res) => {
         if (decoded.banned) {
             return res.status(403).json({ message: "Banned" });
         }
-        return res.status(200).json({ user: decoded });
+
+        const userPayload = {
+            uid:                   decoded.uid,
+            email:                 decoded.email,
+            nombre:                decoded.nombre                || null,
+            admin:                 decoded.admin                 === true,
+            isEnterprise:          !!decoded.isEnterprise,
+            userCertificated:      !!decoded.userCertificated,
+            purchases:             Array.isArray(decoded.purchases) ? decoded.purchases : [],
+            purchaseExpiry:        decoded.purchaseExpiry        || {},
+            enterprisePlan:        decoded.enterprisePlan        || null,
+            enterprisePlanExpiry:  decoded.enterprisePlanExpiry  || null,
+            vacancyLimit:          decoded.vacancyLimit          ?? null,
+            vacanciesUsed:         decoded.vacanciesUsed         ?? 0,
+            companyName:           decoded.companyName           || null,
+            companyLogo:           decoded.companyLogo           || null,
+        };
+
+        return res.status(200).json({ user: userPayload });
     } catch (error) {
         return res.status(401).json({ message: "Invalid token" });
     }
