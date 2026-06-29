@@ -5,8 +5,10 @@ const { Vacancy, IT_SKILLS } = require("../models/vacancyModel");
 const enterpriseMiddleware  = require("../middleware/enterpriseMiddleware");
 const certifiedMiddleware   = require("../middleware/certificatedMiddleware");
 const { notifyNewApplicant } = require("../sseManager/sseApplicants");
-const { notifyUser, userSseHandler }              = require("../sseManager/sseUserNotifications");
-const { CV }                                      = require("../models/cvModel");
+const { notifyUser, userSseHandler } = require("../sseManager/sseUserNotifications");
+const { CV }                         = require("../models/cvModel");
+const auth = require("../config/firebase");
+
 const esProduccion = process.env.NODE_ENV === "production";
 
 const VALID_EXPERIENCE = ["Junior", "Semi-Senior", "Senior", "Lead", "Manager"];
@@ -135,8 +137,7 @@ async function autoCloseExpired(uid) {
 }
 
 // ─── GET /api/public/vacancies ───────────────────────────────────────────────
-// Pública: cualquier usuario puede ver vacantes activas
-// NO devuelve companyName, companyLogo, publishedBy — esos solo los ve el certificado al postularse
+// Pública — nunca expone applicants ni publishedBy
 vacancyRouter.get("/api/public/vacancies", async (req, res) => {
   try {
     const {
@@ -150,8 +151,8 @@ vacancyRouter.get("/api/public/vacancies", async (req, res) => {
     const parsedPage  = parseInt(page);
     const parsedLimit = parseInt(limit);
 
-    if (isNaN(parsedPage)  || parsedPage  < 1) return res.status(400).json({ message: "page debe ser un entero positivo" });
-    if (isNaN(parsedLimit) || parsedLimit < 1 || parsedLimit > 50)  return res.status(400).json({ message: "limit debe ser entre 1 y 50" });
+    if (isNaN(parsedPage)  || parsedPage  < 1)                   return res.status(400).json({ message: "page debe ser un entero positivo" });
+    if (isNaN(parsedLimit) || parsedLimit < 1 || parsedLimit > 100) return res.status(400).json({ message: "limit debe ser entre 1 y 50" });
 
     const filter = { status: "active" };
 
@@ -166,7 +167,7 @@ vacancyRouter.get("/api/public/vacancies", async (req, res) => {
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parsedLimit)
-        .select("-publishedBy -applicants -__v")   // nunca exponer applicants ni publishedBy
+        .select("-publishedBy -applicants -__v")
         .lean(),
       Vacancy.countDocuments(filter),
     ]);
@@ -182,11 +183,13 @@ vacancyRouter.get("/api/public/vacancies", async (req, res) => {
 });
 
 // ─── GET /api/skills-list ─────────────────────────────────────────────────────
-vacancyRouter.get("/api/skills-list", enterpriseMiddleware, async (req, res) => {
+// Accesible para enterprise Y certificados — es una lista estática, no es dato sensible
+vacancyRouter.get("/api/skills-list", certifiedMiddleware, async (req, res) => {
   res.json({ skills: IT_SKILLS });
 });
 
 // ─── GET /api/vacancies ───────────────────────────────────────────────────────
+// Las vacantes de la empresa — con postulantes completos para gestión
 vacancyRouter.get("/api/vacancies", enterpriseMiddleware, async (req, res) => {
   try {
     const {
@@ -200,13 +203,11 @@ vacancyRouter.get("/api/vacancies", enterpriseMiddleware, async (req, res) => {
     const parsedPage  = parseInt(page);
     const parsedLimit = parseInt(limit);
 
-    if (isNaN(parsedPage)  || parsedPage  < 1) return res.status(400).json({ message: "page debe ser un entero positivo" });
+    if (isNaN(parsedPage)  || parsedPage  < 1)                    return res.status(400).json({ message: "page debe ser un entero positivo" });
     if (isNaN(parsedLimit) || parsedLimit < 1 || parsedLimit > 100) return res.status(400).json({ message: "limit debe ser entre 1 y 100" });
 
-    // Cierra vencidas antes de responder — así el cliente siempre ve el estado real
     await autoCloseExpired(req.user.uid);
 
-    // Filtro base: solo las vacantes de ESTA empresa
     const filter = { publishedBy: req.user.uid };
 
     if (status) {
@@ -231,18 +232,14 @@ vacancyRouter.get("/api/vacancies", enterpriseMiddleware, async (req, res) => {
     const skip = (parsedPage - 1) * parsedLimit;
 
     const [vacancies, total] = await Promise.all([
+      // Sin .select() — la empresa ve sus vacantes completas incluyendo applicants
       Vacancy.find(filter).sort({ createdAt: -1 }).skip(skip).limit(parsedLimit).lean(),
       Vacancy.countDocuments(filter),
     ]);
 
     res.json({
       data: vacancies,
-      meta: {
-        total,
-        page:       parsedPage,
-        limit:      parsedLimit,
-        totalPages: Math.ceil(total / parsedLimit),
-      },
+      meta: { total, page: parsedPage, limit: parsedLimit, totalPages: Math.ceil(total / parsedLimit) },
     });
   } catch (err) {
     console.error(esProduccion ? "Error GET /vacancies" : `Error GET /vacancies: ${err}`);
@@ -251,6 +248,7 @@ vacancyRouter.get("/api/vacancies", enterpriseMiddleware, async (req, res) => {
 });
 
 // ─── GET /api/vacancy/:id ─────────────────────────────────────────────────────
+// Detalle completo — la empresa ve todos los datos de sus postulantes
 vacancyRouter.get("/api/vacancy/:id", enterpriseMiddleware, async (req, res) => {
   try {
     const vacancy = await Vacancy.findOne({
@@ -270,14 +268,12 @@ vacancyRouter.get("/api/vacancy/:id", enterpriseMiddleware, async (req, res) => 
 // ─── POST /api/vacancy ────────────────────────────────────────────────────────
 vacancyRouter.post("/api/vacancy", enterpriseMiddleware, async (req, res) => {
   try {
-    // ── Validar plan B2B activo ────────────────────────────────────────────
     const claims     = req.user;
     const plan       = claims.enterprisePlan       ?? null;
     const expiryStr  = claims.enterprisePlanExpiry ?? null;
-    const limit      = claims.vacancyLimit         ?? null;   // null = ilimitado
+    const limit      = claims.vacancyLimit         ?? null;
     const used       = claims.vacanciesUsed        ?? 0;
 
-    // Sin plan activo
     if (!plan || !expiryStr) {
       return res.status(403).json({
         message: "SIN_PLAN_B2B_ACTIVO",
@@ -286,7 +282,6 @@ vacancyRouter.post("/api/vacancy", enterpriseMiddleware, async (req, res) => {
       });
     }
 
-    // Plan vencido
     if (new Date(expiryStr) <= new Date()) {
       return res.status(403).json({
         message: "PLAN_B2B_VENCIDO",
@@ -295,10 +290,9 @@ vacancyRouter.post("/api/vacancy", enterpriseMiddleware, async (req, res) => {
       });
     }
 
-    // Límite de publicaciones alcanzado (solo b2b_seis, b2b_doce es null = ilimitado)
     if (limit !== null && used >= limit) {
       return res.status(403).json({
-        message: `LÍMITE_DE_PUBLICACIONES_ALCANZADO`,
+        message: "LÍMITE_DE_PUBLICACIONES_ALCANZADO",
         detail:  `Tu plan ${plan.toUpperCase()} permite hasta ${limit} publicaciones. Ya usaste las ${used}.`,
         code:    "VACANCY_LIMIT_REACHED",
         limit,
@@ -333,10 +327,9 @@ vacancyRouter.post("/api/vacancy", enterpriseMiddleware, async (req, res) => {
 
     const saved = await vacancy.save();
 
-    // ── Incrementar vacanciesUsed en Firebase si hay límite ───────────────
+    // Incrementar vacanciesUsed en Firebase si hay límite
     if (limit !== null) {
-      const auth         = require("../config/firebase");
-      const userRecord   = await auth.getUser(req.user.uid);
+      const userRecord    = await auth.getUser(req.user.uid);
       const currentClaims = userRecord.customClaims || {};
       await auth.setCustomUserClaims(req.user.uid, {
         ...currentClaims,
@@ -404,13 +397,12 @@ vacancyRouter.patch("/api/vacancy/:id/status", enterpriseMiddleware, async (req,
   try {
     const { status } = req.body;
 
-    if (!status) return res.status(400).json({ message: "status es requerido" });
-    if (typeof status !== "string") return res.status(400).json({ message: "status debe ser un string" });
+    if (!status)                     return res.status(400).json({ message: "status es requerido" });
+    if (typeof status !== "string")  return res.status(400).json({ message: "status debe ser un string" });
     if (!VALID_STATUS.includes(status)) {
       return res.status(400).json({ message: `status inválido. Opciones: ${VALID_STATUS.join(", ")}` });
     }
 
-    // No permitir reactivar una vacante que ya venció
     if (status === "active") {
       const vacancy = await Vacancy.findOne({ _id: req.params.id, publishedBy: req.user.uid });
       if (!vacancy) return res.status(404).json({ message: "Vacante no encontrada o no autorizado" });
@@ -435,18 +427,17 @@ vacancyRouter.patch("/api/vacancy/:id/status", enterpriseMiddleware, async (req,
 });
 
 // ─── GET /api/user/applications ──────────────────────────────────────────────
-// Devuelve los vacancyIds donde el usuario ya aplicó
 vacancyRouter.get("/api/user/applications", certifiedMiddleware, async (req, res) => {
   try {
     const vacancies = await Vacancy.find(
       { "applicants.userId": req.user.uid },
-      { _id: 1, title: 1, "applicants.$": 1 }   // solo el elemento que matchea
+      { _id: 1, title: 1, "applicants.$": 1 }
     ).lean();
 
     const applications = vacancies.map((v) => ({
       vacancyId: v._id,
       title:     v.title,
-      status:    v.applicants?.[0]?.status ?? "pending",
+      status:    v.applicants?.[0]?.status   ?? "pending",
       appliedAt: v.applicants?.[0]?.appliedAt ?? null,
     }));
 
@@ -460,15 +451,13 @@ vacancyRouter.get("/api/user/applications", certifiedMiddleware, async (req, res
 // ─── PATCH /api/vacancy/:id/applicants ───────────────────────────────────────
 vacancyRouter.patch("/api/vacancy/:id/applicants", certifiedMiddleware, async (req, res) => {
   try {
-    const userId  = req.user.uid;
+    const userId      = req.user.uid;
     const { consent } = req.body;
 
-    // Verificar consentimiento explícito
     if (!consent) {
       return res.status(400).json({ message: "Se requiere consentimiento para compartir datos personales" });
     }
 
-    // Verificar que el usuario tiene CV creado
     const cv = await CV.findOne({ userId }).lean();
     if (!cv) {
       return res.status(400).json({ message: "CV_REQUIRED", detail: "Debés crear tu CV antes de postularte" });
@@ -480,7 +469,6 @@ vacancyRouter.patch("/api/vacancy/:id/applicants", certifiedMiddleware, async (r
       return res.status(400).json({ message: "No se puede aplicar a una vacante que no está activa" });
     }
 
-    // Verificar duplicado
     const yaAplico = vacancy.applicants.some((a) => a.userId === userId.trim());
     if (yaAplico) {
       return res.status(409).json({ message: "El usuario ya aplicó a esta vacante" });
@@ -503,7 +491,6 @@ vacancyRouter.patch("/api/vacancy/:id/applicants", certifiedMiddleware, async (r
       { returnDocument: "after" }
     );
 
-    // SSE solo notifica — los datos ya están en la DB
     const applicantName = [cv.personalInfo?.firstName, cv.personalInfo?.lastName].filter(Boolean).join(" ") || userId;
     notifyNewApplicant(vacancy._id.toString(), vacancy.title, userId.trim(), applicantName);
 
@@ -516,7 +503,6 @@ vacancyRouter.patch("/api/vacancy/:id/applicants", certifiedMiddleware, async (r
 });
 
 // ─── PATCH /api/vacancy/:id/applicants/:userId/status ────────────────────────
-// La empresa cambia el estado de una postulación específica
 vacancyRouter.patch("/api/vacancy/:id/applicants/:userId/status", enterpriseMiddleware, async (req, res) => {
   try {
     const { status } = req.body;
@@ -539,13 +525,13 @@ vacancyRouter.patch("/api/vacancy/:id/applicants/:userId/status", enterpriseMidd
       { returnDocument: "after" }
     );
 
-    // Notificar al usuario via SSE
+    // companyName y companyLogo desde la vacante en DB — no desde las claims
     notifyUser(req.params.userId, {
-      type:        "application_status",
-      vacancyId:   vacancy._id.toString(),
+      type:         "application_status",
+      vacancyId:    vacancy._id.toString(),
       vacancyTitle: vacancy.title,
-      companyName: req.user.companyName || null,
-      companyLogo: req.user.companyLogo || null,
+      companyName:  vacancy.companyName || null,
+      companyLogo:  vacancy.companyLogo || null,
       status,
     });
 
@@ -558,7 +544,6 @@ vacancyRouter.patch("/api/vacancy/:id/applicants/:userId/status", enterpriseMidd
 });
 
 // ─── DELETE /api/vacancy/:id/applicants/:userId ───────────────────────────────
-// La empresa elimina un postulante de una vacante (ej: rechazados)
 vacancyRouter.delete("/api/vacancy/:id/applicants/:userId", enterpriseMiddleware, async (req, res) => {
   try {
     const vacancy = await Vacancy.findOne({ _id: req.params.id, publishedBy: req.user.uid });
@@ -581,7 +566,6 @@ vacancyRouter.delete("/api/vacancy/:id/applicants/:userId", enterpriseMiddleware
 });
 
 // ─── GET /api/user/notifications/stream ──────────────────────────────────────
-// SSE para el usuario — recibe notificaciones de cambios en sus postulaciones
 vacancyRouter.get("/api/user/notifications/stream", certifiedMiddleware, userSseHandler);
 
 // ─── DELETE /api/vacancy/:id ──────────────────────────────────────────────────
@@ -594,21 +578,18 @@ vacancyRouter.delete("/api/vacancy/:id", enterpriseMiddleware, async (req, res) 
 
     if (!deleted) return res.status(404).json({ message: "Vacante no encontrada o no autorizado" });
 
-    // ── Recuperar cupo si el plan tiene límite (b2b_seis) ─────────────────
+    // Recuperar cupo si el plan tiene límite (b2b_seis)
     const limit = req.user.vacancyLimit ?? null;
     if (limit !== null) {
       try {
-        const auth         = require("../config/firebase");
-        const userRecord   = await auth.getUser(req.user.uid);
+        const userRecord    = await auth.getUser(req.user.uid);
         const currentClaims = userRecord.customClaims || {};
-        const currentUsed  = currentClaims.vacanciesUsed ?? 0;
+        const currentUsed   = currentClaims.vacanciesUsed ?? 0;
         await auth.setCustomUserClaims(req.user.uid, {
           ...currentClaims,
           vacanciesUsed: Math.max(0, currentUsed - 1),
         });
-        console.log(`♻️  Cupo recuperado para ${req.user.uid}. Used: ${currentUsed} → ${Math.max(0, currentUsed - 1)}`);
       } catch (claimErr) {
-        // No bloquear la respuesta si falla el update de claims
         console.error("Error actualizando vacanciesUsed:", claimErr.message);
       }
     }

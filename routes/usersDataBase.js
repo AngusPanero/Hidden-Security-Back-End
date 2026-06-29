@@ -1,30 +1,71 @@
 const express  = require("express");
 const usersDbRouter = express.Router();
 
-const { CV }              = require("../models/cvModel");
+const { CV }               = require("../models/cvModel");
 const enterpriseMiddleware = require("../middleware/enterpriseMiddleware");
 const auth                 = require("../config/firebase");
 
 const esProduccion = process.env.NODE_ENV === "production";
 
+// ─── Rate limiting simple por IP ──────────────────────────────────────────────
+// Evita que una empresa haga requests en loop y genere full-scans repetidos
+const requestCounts = new Map();
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minuto
+const RATE_LIMIT_MAX       = 30;        // máx 30 requests por minuto por IP
+
+function rateLimiter(req, res, next) {
+  const ip  = req.ip || req.headers["x-forwarded-for"] || "unknown";
+  const now = Date.now();
+
+  if (!requestCounts.has(ip)) {
+    requestCounts.set(ip, { count: 1, windowStart: now });
+    return next();
+  }
+
+  const entry = requestCounts.get(ip);
+
+  if (now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    // Nueva ventana
+    requestCounts.set(ip, { count: 1, windowStart: now });
+    return next();
+  }
+
+  entry.count++;
+  if (entry.count > RATE_LIMIT_MAX) {
+    return res.status(429).json({ message: "Demasiadas solicitudes. Intentá en un momento." });
+  }
+
+  next();
+}
+
+// ─── Helper: formatear CV para empresa ───────────────────────────────────────
+// No expone userId (Firebase UID interno)
+function formatForEnterprise(cv, claims) {
+  return {
+    // userId intencionalmente omitido — la empresa no necesita el Firebase UID
+    personalInfo:            cv.personalInfo,
+    skills:                  cv.skills          || [],
+    experience:              cv.experience       || [],
+    education:               cv.education        || [],
+    certifications:          cv.certifications   || [],
+    languages:               cv.languages        || [],
+    projects:                cv.projects         || [],
+    availability:            cv.availability     || null,
+    workPreferences:         cv.workPreferences  || {},  // salario siempre visible
+    updatedAt:               cv.updatedAt,
+    userCertificated:        !!claims.userCertificated,
+    skillsCertifiedByHidden: Array.isArray(claims.skillsCertifiedByHidden)
+      ? claims.skillsCertifiedByHidden
+      : [],
+  };
+}
+
 // ─── GET /api/users-database ──────────────────────────────────────────────────
-// Devuelve CVs + claims relevantes de cada usuario, con filtros y paginación.
-// Solo accesible para enterprise.
-//
-// Query params:
-//   page              número de página (default 1)
-//   limit             resultados por página (default 15)
-//   search            busca en nombre, apellido, email, headline
-//   declaredSkills    skills declaradas por el usuario, separadas por coma
-//   certifiedSkills   skills certificadas por Hidden, separadas por coma
-//   certifiedOnly     "true" → solo usuarios con userCertificated
-//   availability      filtra por disponibilidad exacta
-//   modality          filtra por modalidad de trabajo (Remoto/Híbrido/Presencial)
-usersDbRouter.get("/api/users-database", enterpriseMiddleware, async (req, res) => {
+usersDbRouter.get("/api/users-database", enterpriseMiddleware, rateLimiter, async (req, res) => {
   try {
     const {
-      page  = 1,
-      limit = 15,
+      page             = 1,
+      limit            = 15,
       search           = "",
       declaredSkills   = "",
       certifiedSkills  = "",
@@ -36,13 +77,13 @@ usersDbRouter.get("/api/users-database", enterpriseMiddleware, async (req, res) 
     const parsedPage  = parseInt(page);
     const parsedLimit = parseInt(limit);
 
-    if (isNaN(parsedPage)  || parsedPage  < 1) return res.status(400).json({ message: "page debe ser un entero positivo" });
-    if (isNaN(parsedLimit) || parsedLimit < 1 || parsedLimit > 100) return res.status(400).json({ message: "limit debe ser entre 1 y 100" });
+    if (isNaN(parsedPage)  || parsedPage  < 1)                    return res.status(400).json({ message: "page debe ser un entero positivo" });
+    if (isNaN(parsedLimit) || parsedLimit < 1 || parsedLimit > 50) return res.status(400).json({ message: "limit debe ser entre 1 y 50" });
 
     const declaredSkillsArr  = declaredSkills  ? declaredSkills.split(",").map(s => s.trim()).filter(Boolean)  : [];
     const certifiedSkillsArr = certifiedSkills ? certifiedSkills.split(",").map(s => s.trim()).filter(Boolean) : [];
 
-    // ── Filtro Mongo: lo que se puede filtrar a nivel DB ───────────────────
+    // ── Filtro Mongo ───────────────────────────────────────────────────────
     const filter = {};
 
     if (search) {
@@ -55,23 +96,15 @@ usersDbRouter.get("/api/users-database", enterpriseMiddleware, async (req, res) 
       ];
     }
 
-    if (declaredSkillsArr.length > 0) {
-      // al menos una de las skills declaradas solicitadas
-      filter.skills = { $in: declaredSkillsArr };
-    }
+    if (declaredSkillsArr.length > 0) filter.skills          = { $in: declaredSkillsArr };
+    if (availability)                  filter.availability    = availability;
+    if (modality)                      filter["workPreferences.modality"] = modality;
 
-    if (availability) {
-      filter.availability = availability;
-    }
-
-    if (modality) {
-      filter["workPreferences.modality"] = modality;
-    }
-
-    // ── Traer TODOS los matches de Mongo (sin paginar aún) ─────────────────
-    // Necesario porque certifiedOnly y certifiedSkills dependen de Firebase claims,
-    // que no se pueden filtrar en la query de Mongo.
-    const allMatches = await CV.find(filter).lean();
+    // ── Traer matches de Mongo ─────────────────────────────────────────────
+    // Necesario traer todos porque certifiedOnly y certifiedSkills dependen
+    // de Firebase claims que no se pueden filtrar en Mongo.
+    // Limitamos a 500 como techo absoluto para evitar full-scans ilimitados.
+    const allMatches = await CV.find(filter).limit(500).lean();
 
     if (!allMatches.length) {
       return res.json({
@@ -81,7 +114,7 @@ usersDbRouter.get("/api/users-database", enterpriseMiddleware, async (req, res) 
       });
     }
 
-    // ── Traer claims de Firebase para cada userId en paralelo ──────────────
+    // ── Traer claims de Firebase para cada usuario en paralelo ─────────────
     const withClaims = await Promise.all(
       allMatches.map(async (cv) => {
         let claims = {};
@@ -91,28 +124,11 @@ usersDbRouter.get("/api/users-database", enterpriseMiddleware, async (req, res) 
         } catch (err) {
           console.error(`No se pudo obtener claims de ${cv.userId}: ${err.message}`);
         }
-
-        return {
-          userId:                  cv.userId,
-          personalInfo:            cv.personalInfo,
-          skills:                  cv.skills || [],
-          experience:              cv.experience || [],
-          education:               cv.education || [],
-          certifications:          cv.certifications || [],
-          languages:               cv.languages || [],
-          projects:                cv.projects || [],
-          availability:            cv.availability,
-          workPreferences:         cv.workPreferences,
-          updatedAt:               cv.updatedAt,
-          userCertificated:        !!claims.userCertificated,
-          skillsCertifiedByHidden: Array.isArray(claims.skillsCertifiedByHidden)
-            ? claims.skillsCertifiedByHidden
-            : [],
-        };
+        return formatForEnterprise(cv, claims);
       })
     );
 
-    // ── Filtros que dependen de claims (post-fetch) ────────────────────────
+    // ── Filtros post-fetch (dependen de claims) ────────────────────────────
     let filtered = withClaims;
 
     if (certifiedOnly === "true") {
@@ -125,8 +141,7 @@ usersDbRouter.get("/api/users-database", enterpriseMiddleware, async (req, res) 
       );
     }
 
-    // ── Calcular skills solicitadas que NO aparecen en ningún resultado ────
-    // (para el mensaje "no encontramos candidatos con: X, Y")
+    // ── Skills sin resultados (para mensaje de UI) ─────────────────────────
     const allDeclaredInResults  = new Set(filtered.flatMap(u => u.skills));
     const allCertifiedInResults = new Set(filtered.flatMap(u => u.skillsCertifiedByHidden));
 
@@ -139,7 +154,7 @@ usersDbRouter.get("/api/users-database", enterpriseMiddleware, async (req, res) 
       return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
     });
 
-    // ── Paginar sobre el resultado ya filtrado ─────────────────────────────
+    // ── Paginar ────────────────────────────────────────────────────────────
     const total      = filtered.length;
     const totalPages = Math.ceil(total / parsedLimit);
     const skip       = (parsedPage - 1) * parsedLimit;
@@ -148,11 +163,9 @@ usersDbRouter.get("/api/users-database", enterpriseMiddleware, async (req, res) 
     res.json({
       data: pageData,
       meta: { total, page: parsedPage, limit: parsedLimit, totalPages },
-      unmatchedSkills: {
-        declared:  unmatchedDeclared,
-        certified: unmatchedCertified,
-      },
+      unmatchedSkills: { declared: unmatchedDeclared, certified: unmatchedCertified },
     });
+
   } catch (err) {
     console.error(esProduccion ? "Error GET /users-database" : `Error GET /users-database: ${err}`);
     res.status(500).json({ message: "Error al obtener la base de usuarios" });
@@ -160,17 +173,16 @@ usersDbRouter.get("/api/users-database", enterpriseMiddleware, async (req, res) 
 });
 
 // ─── GET /api/users-database/skills-summary ──────────────────────────────────
-// Devuelve la lista de skills declaradas y certificadas que existen en la DB,
-// para poblar los checkboxes de filtro dinámicamente.
-usersDbRouter.get("/api/users-database/skills-summary", enterpriseMiddleware, async (req, res) => {
+usersDbRouter.get("/api/users-database/skills-summary", enterpriseMiddleware, rateLimiter, async (req, res) => {
   try {
-    const cvs = await CV.find({}, { skills: 1, userId: 1 }).lean();
+    // Límite de 500 CVs para el resumen — evita full-scan ilimitado
+    const cvs = await CV.find({}, { skills: 1, userId: 1 }).limit(500).lean();
 
-    const declaredSet = new Set();
+    const declaredSet  = new Set();
+    const certifiedSet = new Set();
+
     cvs.forEach(cv => (cv.skills || []).forEach(s => declaredSet.add(s)));
 
-    // Claims — recolectar skillsCertifiedByHidden de todos los usuarios con CV
-    const certifiedSet = new Set();
     await Promise.all(cvs.map(async (cv) => {
       try {
         const userRecord = await auth.getUser(cv.userId);
@@ -183,6 +195,7 @@ usersDbRouter.get("/api/users-database/skills-summary", enterpriseMiddleware, as
       declaredSkills:  Array.from(declaredSet).sort(),
       certifiedSkills: Array.from(certifiedSet).sort(),
     });
+
   } catch (err) {
     console.error(esProduccion ? "Error GET /skills-summary" : `Error GET /skills-summary: ${err}`);
     res.status(500).json({ message: "Error al obtener resumen de skills" });

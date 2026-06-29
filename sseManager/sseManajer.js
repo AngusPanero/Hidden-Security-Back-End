@@ -10,15 +10,15 @@ const notifyNewSale = (payment) => {
         checked:   payment.checked ?? false,
         createdAt: payment.createdAt,
     });
-    console.log(`📢 SSE notify — clientes: ${sseClients.size} — ${payment.email}`);
+    /* console.log(`📢 SSE notify — clientes: ${sseClients.size} — ${payment.email}`); */
     sseClients.forEach(client => {
         try { client.write(`data: ${data}\n\n`); }
         catch (_) { sseClients.delete(client); }
     });
 };
 
-const sseHandler = (req, res) => {
-    console.log(`🔌 SSE conectado — total: ${sseClients.size + 1}`);
+const sseHandler = (req, res) => {/* 
+    console.log(`🔌 SSE conectado — total: ${sseClients.size + 1}`); */
     res.setHeader("Content-Type",      "text/event-stream");
     res.setHeader("Cache-Control",     "no-cache");
     res.setHeader("Connection",        "keep-alive");

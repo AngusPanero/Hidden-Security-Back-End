@@ -12,7 +12,7 @@ const notifyNewApplicant = (vacancyId, vacancyTitle, userId, applicantName = "")
         createdAt: new Date().toISOString(),
     });
 
-    console.log(`📢 SSE applicant notify — clientes: ${applicantSseClients.size} — vacancy: ${vacancyTitle}`);
+    /* console.log(`📢 SSE applicant notify — clientes: ${applicantSseClients.size} — vacancy: ${vacancyTitle}`); */
 
     applicantSseClients.forEach((client) => {
         try { client.write(`data: ${data}\n\n`); }
@@ -22,7 +22,7 @@ const notifyNewApplicant = (vacancyId, vacancyTitle, userId, applicantName = "")
 
 // ─── Handler SSE para empresas ────────────────────────────────────────────────
 const applicantSseHandler = (req, res) => {
-    console.log(`🔌 SSE applicant conectado — total: ${applicantSseClients.size + 1}`);
+    /* console.log(`🔌 SSE applicant conectado — total: ${applicantSseClients.size + 1}`); */
 
     res.setHeader("Content-Type",      "text/event-stream");
     res.setHeader("Cache-Control",     "no-cache");
@@ -40,7 +40,7 @@ const applicantSseHandler = (req, res) => {
     req.on("close", () => {
         clearInterval(ping);
         applicantSseClients.delete(res);
-        console.log(`🔌 SSE applicant desconectado — total: ${applicantSseClients.size}`);
+        /* console.log(`🔌 SSE applicant desconectado — total: ${applicantSseClients.size}`); */
     });
 };
 
