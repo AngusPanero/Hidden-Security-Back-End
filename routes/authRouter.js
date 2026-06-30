@@ -236,21 +236,21 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
         });
 
         // 6. Configurar Cookie
-        /* res.cookie("idToken", idToken, {
+        res.cookie("idToken", idToken, {
             httpOnly: true,
             sameSite: "lax",
             secure: true,
             domain: ".hidden-security.org",
             maxAge: 60 * 60 * 1000,
             path: "/"
-        }); */
+        });
 
-        res.cookie("idToken", idToken, {
+       /*  res.cookie("idToken", idToken, {
             httpOnly: true,
             sameSite: "none",
             secure: true,
             path: "/" 
-        });
+        }); */
 
         // ── Objeto de usuario propio — nunca mandar decoded directo ──────────
         const userPayload = {
@@ -386,20 +386,20 @@ authRouter.post("/logout", async (req, res) => {
             });
         }
 
-        /* res.clearCookie("idToken", {
+        res.clearCookie("idToken", {
             httpOnly: true,
             sameSite: "lax",
             secure: true,
             domain: ".hidden-security.org",
             path: "/" 
-        }); */
+        });
 
-        res.clearCookie("idToken", {
+       /*  res.clearCookie("idToken", {
             httpOnly: true,
             sameSite: "none",
             secure: true,
             path: "/" 
-        });
+        }); */
 
         return res.status(200).json({ message: "Logout audited! 🟢" })
     } catch (error) {
