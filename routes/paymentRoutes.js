@@ -18,20 +18,20 @@ const PLAN_DURATIONS = {
     starter:  3,
     pro:      6,
     elite:    12,
-    b2b_seis: 6,
-    b2b_doce: 12,
+    business: 6,
+    enterprise: 12,
     // voucher: undefined — sin vencimiento por tiempo
 };
 
-const VALID_PLANS = ['starter', 'pro', 'elite', 'voucher', 'b2b_seis', 'b2b_doce'];
+const VALID_PLANS = ['starter', 'pro', 'elite', 'voucher', 'business', 'enterprise'];
 
 const PLAN_PRICES = {
-    starter:  80000,
-    pro:      250000,
-    elite:    350000,
-    voucher:  180000,
-    b2b_seis: 400000,
-    b2b_doce: 700000,
+    starter:  100000,
+    pro:      200000,
+    elite:    300000,
+    voucher:  150000,
+    business: 900000,
+    enterprise: 1500000,
 };
 
 const BUNDLED_VOUCHERS = {
@@ -40,13 +40,13 @@ const BUNDLED_VOUCHERS = {
 };
 
 // Planes exclusivos por tipo de usuario
-const ENTERPRISE_PLANS = ['b2b_seis', 'b2b_doce'];
+const ENTERPRISE_PLANS = ['business', 'enterprise'];
 const USER_PLANS        = ['starter', 'pro', 'elite', 'voucher'];
 
 // Límite de publicaciones por plan enterprise
 const ENTERPRISE_VACANCY_LIMITS = {
-    b2b_seis: 3,    // 6 meses → 3 publicaciones
-    b2b_doce: null, // 12 meses → ilimitadas (null = sin límite)
+    business: 3,    // 6 meses → 3 publicaciones
+    enterprise: null, // 12 meses → ilimitadas (null = sin límite)
 };
 
 // ─── Helper: calcular fecha de expiración ──────────────────────────────────────
@@ -279,7 +279,7 @@ paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
                 enterprisePlan:       planId,
                 enterprisePlanExpiry: expiresAt.toISOString(),
                 enterprisePurchasedAt: new Date().toISOString(),
-                vacancyLimit,          // 3 para b2b_seis, null para b2b_doce
+                vacancyLimit,          // 3 para business, null para enterprise
                 vacanciesUsed: currentClaims.vacanciesUsed ?? 0, // contador de publicaciones
             });
 
