@@ -42,7 +42,7 @@ function rateLimiter(req, res, next) {
 // No expone userId (Firebase UID interno)
 function formatForEnterprise(cv, claims) {
   return {
-    // userId intencionalmente omitido — la empresa no necesita el Firebase UID
+    id:                      cv._id.toString(), // ID de Mongo — único, no expone Firebase UID
     personalInfo:            cv.personalInfo,
     skills:                  cv.skills          || [],
     experience:              cv.experience       || [],
@@ -51,7 +51,7 @@ function formatForEnterprise(cv, claims) {
     languages:               cv.languages        || [],
     projects:                cv.projects         || [],
     availability:            cv.availability     || null,
-    workPreferences:         cv.workPreferences  || {},  // salario siempre visible
+    workPreferences:         cv.workPreferences  || {},
     updatedAt:               cv.updatedAt,
     userCertificated:        !!claims.userCertificated,
     skillsCertifiedByHidden: Array.isArray(claims.skillsCertifiedByHidden)
