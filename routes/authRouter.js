@@ -214,7 +214,7 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
         const isAdmin      = decoded.admin      === true;
         const isEnterprise = !!decoded.isEnterprise;
 
-        if (!isAdmin && !isEnterprise) {
+        /* if (!isAdmin && !isEnterprise) {
             const userRecord = await auth.getUser(uid);
             if (!userRecord.emailVerified) {
                 return res.status(403).json({
@@ -222,7 +222,7 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
                     message: "Debés verificar tu email antes de ingresar.",
                 });
             }
-        }
+        } */
 
         // 5. Limpiar intentos fallidos y auditar login exitoso
         await Audit.findOneAndUpdate(
