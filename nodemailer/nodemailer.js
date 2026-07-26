@@ -1,21 +1,33 @@
 const express      = require("express");
-const nodemailer   = require("nodemailer");
 const multer       = require("multer");
 const Contact      = require("../models/ContactSchema");
 const PaymentsMongo = require("../models/Payments");
 const adminMiddleware = require("../middleware/adminMiddleware");
+const { BrevoClient } = require("@getbrevo/brevo");
 
 const mailRouter = express.Router();
 const esProduccion = process.env.NODE_ENV === "production";
 
-// ── TRANSPORTER ───────────────────────────────────────────────
-const createTransporter = () => nodemailer.createTransport({
-    service: "gmail",
-    auth: {
-        user: process.env.EMAIL_FROM,
-        pass: process.env.PASS_EMAIL
+// ── BREVO CLIENT ──────────────────────────────────────────────
+const brevo = new BrevoClient({ apiKey: process.env.BREVO_API_KEY });
+
+async function sendMail({ to, subject, html, attachments = [] }) {
+    const payload = {
+        sender:      { email: process.env.EMAIL_FROM, name: "Hidden Security" },
+        to:          [{ email: to }],
+        subject,
+        htmlContent: html,
+    };
+
+    if (attachments.length > 0) {
+        payload.attachment = attachments.map(a => ({
+            name:    a.filename,
+            content: a.content.toString("base64"),
+        }));
     }
-});
+
+    await brevo.transactionalEmails.sendTransacEmail(payload);
+}
 
 // ── BLOQUES HTML COMPARTIDOS ──────────────────────────────────
 const emailHead = (title) => `
@@ -100,7 +112,7 @@ const divisor = `
     </table>`;
 
 
-// Contact 
+// ── Contact ───────────────────────────────────────────────────
 mailRouter.post("/contact", async (req, res) => {
     const { name, surname, email, tel, text } = req.body;
 
@@ -116,11 +128,7 @@ mailRouter.post("/contact", async (req, res) => {
     }
 
     try {
-        const transporter = createTransporter();
-        await transporter.verify();
-
-        const result = await transporter.sendMail({
-            from:    process.env.EMAIL_FROM,
+        await sendMail({
             to:      process.env.EMAIL_FROM,
             subject: `Nueva consulta — ${name} ${surname}`,
             html: `
@@ -191,7 +199,7 @@ mailRouter.post("/contact", async (req, res) => {
     return res.status(201).json({ message: "Contact form submitted successfully! 🟢" });
 });
 
-// Confirmación al comprador
+// ── Confirmación al comprador ─────────────────────────────────
 mailRouter.post("/confirm-order", async (req, res) => {
     const { email } = req.body;
 
@@ -232,13 +240,7 @@ mailRouter.post("/confirm-order", async (req, res) => {
     ${emailFirma}`;
 
     try {
-        const transporter = createTransporter();
-        await transporter.sendMail({
-            from:    process.env.EMAIL_FROM,
-            to:      email,
-            subject: "Confirmación de compra — Hidden Security",
-            html
-        });
+        await sendMail({ to: email, subject: "Confirmación de compra — Hidden Security", html });
         res.status(200).json({ success: true, message: "Correo enviado con éxito" });
     } catch (error) {
         console.error(esProduccion ? "Error sending mail 🔴" : `Error sending mail 🔴 ${error}`);
@@ -246,7 +248,7 @@ mailRouter.post("/confirm-order", async (req, res) => {
     }
 });
 
-// Factura adjunta al comprador
+// ── Factura adjunta al comprador ──────────────────────────────
 const upload = multer({ storage: multer.memoryStorage() });
 
 mailRouter.post("/:id/send-invoice", upload.single("invoice"), adminMiddleware, async (req, res) => {
@@ -295,16 +297,13 @@ mailRouter.post("/:id/send-invoice", upload.single("invoice"), adminMiddleware, 
     ${emailFirma}`;
 
     try {
-        const transporter = createTransporter();
-        await transporter.sendMail({
-            from:    process.env.EMAIL_FROM,
+        await sendMail({
             to:      email,
             subject: "Factura de tu compra — Hidden Security",
             html,
             attachments: [{
-                filename:    file.originalname,
-                content:     file.buffer,
-                contentType: file.mimetype,
+                filename: file.originalname,
+                content:  file.buffer,
             }]
         });
 
