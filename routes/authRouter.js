@@ -19,7 +19,10 @@ const brevo = new BrevoClient({ apiKey: process.env.BREVO_API_KEY });
  
 async function sendVerificationEmail(email) {
     const frontendUrl = process.env.FRONT_END || process.env.LOCAL_HOST || "http://localhost:5173";
- 
+    
+    console.log("[ENV CHECK] BREVO_API_KEY:", process.env.BREVO_API_KEY ? "✓ set" : "✗ MISSING");
+    console.log("[ENV CHECK] EMAIL_FROM:", process.env.EMAIL_FROM ?? "✗ MISSING");
+
     // Admin SDK genera el link — no necesita idToken ni contraseña del usuario
     const link = await auth.generateEmailVerificationLink(email, {
         url: `${frontendUrl}/dashboard`,
