@@ -12,28 +12,19 @@ const verifyToken = require("../middleware/authMiddleware")
 const adminMiddleware = require("../middleware/adminMiddleware")
 // Axios
 const axios = require("axios")
-// Nodemailer — mismo transporter que mailRouter
-const nodemailer = require("nodemailer")
+// BREVO
+const { BrevoClient } = require("@getbrevo/brevo");
 
-const esProduccion = (process.env.NODE_ENV === 'production');
-
-const createTransporter = () => nodemailer.createTransport({
-    service: "gmail",
-    auth: {
-        user: process.env.EMAIL_FROM,
-        pass: process.env.PASS_EMAIL,
-    },
-});
-
-// ─── Helper: enviar email de verificación ─────────────────────────────────────
+const brevo = new BrevoClient({ apiKey: process.env.BREVO_API_KEY });
+ 
 async function sendVerificationEmail(email) {
     const frontendUrl = process.env.FRONT_END || process.env.LOCAL_HOST || "http://localhost:5173";
-
+ 
     // Admin SDK genera el link — no necesita idToken ni contraseña del usuario
     const link = await auth.generateEmailVerificationLink(email, {
         url: `${frontendUrl}/dashboard`,
     });
-
+ 
     const html = `
 <!DOCTYPE html>
 <html lang="es" xmlns="http://www.w3.org/1999/xhtml">
@@ -49,7 +40,7 @@ async function sendVerificationEmail(email) {
     <tr><td align="center">
     <table role="presentation" width="600" cellpadding="0" cellspacing="0"
         style="max-width:600px; width:100%; background-color:#000000; border:1px solid #ccff00;">
-
+ 
         <tr>
             <td style="background-color:#ccff00; padding:28px 40px 24px;">
             <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
@@ -63,23 +54,23 @@ async function sendVerificationEmail(email) {
             </tr></table>
             </td>
         </tr>
-
+ 
         <tr><td style="background-color:#000000; padding:44px 40px 40px;">
-
+ 
             <table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
                 <tr><td>
                 <span style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:3px; text-transform:uppercase; color:#ccff00; border:1px solid rgba(204,255,0,0.35); padding:5px 14px; background:rgba(204,255,0,0.06); display:inline-block;">⚡ ACTIVACIÓN_REQUERIDA</span>
                 </td></tr>
             </table>
-
+ 
             <p style="font-family:'Montserrat',Arial,sans-serif; font-size:32px; font-weight:900; letter-spacing:-2px; text-transform:uppercase; color:#ffffff; line-height:1.05; margin:0 0 18px;">
                 CONFIRMÁ<br/><span style="color:#ccff00; font-weight:400;">TU CUENTA.</span>
             </p>
-
+ 
             <p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; color:rgba(255,255,255,0.55); line-height:1.85; margin:0 0 36px;">
                 Hacé click en el botón de abajo para activar tu cuenta y acceder a la plataforma Hidden Security. Este link es válido por 24 horas.
             </p>
-
+ 
             <table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:36px;">
                 <tr>
                     <td style="background-color:#ccff00;">
@@ -89,12 +80,12 @@ async function sendVerificationEmail(email) {
                     </td>
                 </tr>
             </table>
-
+ 
             <p style="font-family:'Montserrat',Arial,sans-serif; font-size:8px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(255,255,255,0.2); margin:0 0 8px;">// Si el botón no funciona, copiá este link:</p>
             <p style="font-family:'Montserrat',Arial,sans-serif; font-size:10px; color:rgba(255,255,255,0.25); word-break:break-all; line-height:1.6; margin:0;">${link}</p>
-
+ 
         </td></tr>
-
+ 
         <tr>
             <td style="background-color:#0a0a0a; border-top:1px solid rgba(204,255,0,0.15); padding:24px 40px;">
             <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
@@ -112,20 +103,19 @@ async function sendVerificationEmail(email) {
             </tr></table>
             </td>
         </tr>
-
+ 
     </table>
     </td></tr>
 </table>
 </body></html>`;
-
-    const transporter = createTransporter();
-    await transporter.sendMail({
-        from:    process.env.EMAIL_FROM,
-        to:      email,
-        subject: "Verificá tu cuenta — Hidden Security",
-        html,
+ 
+    await brevo.transactionalEmails.sendTransacEmail({
+        sender:      { email: process.env.EMAIL_FROM, name: "Hidden Security" },
+        to:          [{ email }],
+        subject:     "Verificá tu cuenta — Hidden Security",
+        htmlContent: html,
     });
-
+ 
     console.log(`✅ Email de verificación enviado a ${email}`);
 }
 
@@ -214,7 +204,7 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
         const isAdmin      = decoded.admin      === true;
         const isEnterprise = !!decoded.isEnterprise;
 
-        /* if (!isAdmin && !isEnterprise) {
+        if (!isAdmin && !isEnterprise) {
             const userRecord = await auth.getUser(uid);
             if (!userRecord.emailVerified) {
                 return res.status(403).json({
@@ -222,7 +212,7 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
                     message: "Debés verificar tu email antes de ingresar.",
                 });
             }
-        } */
+        }
 
         // 5. Limpiar intentos fallidos y auditar login exitoso
         await Audit.findOneAndUpdate(
