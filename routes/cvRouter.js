@@ -24,6 +24,9 @@ function sanitizeDeep(obj) {
   return sanitizeString(obj);
 }
 
+// Estructura vacía por defecto para skills (evita undefined en clientes viejos)
+const EMPTY_SKILLS = { roles: [], habilidades: [], herramientas: [] };
+
 // ─── Helper: proyección limpia del CV para el propio usuario ─────────────────
 // Excluye campos internos de Mongo (_id de subdocs, __v, etc.)
 function formatCVForOwner(cv) {
@@ -31,7 +34,7 @@ function formatCVForOwner(cv) {
   return {
     userId:          cv.userId,
     personalInfo:    cv.personalInfo,
-    skills:          cv.skills          || [],
+    skills:          cv.skills          || EMPTY_SKILLS,
     experience:      cv.experience      || [],
     education:       cv.education       || [],
     certifications:  cv.certifications  || [],
@@ -51,7 +54,7 @@ function formatCVForEnterprise(cv) {
   if (!cv) return null;
   return {
     personalInfo:   cv.personalInfo,
-    skills:         cv.skills         || [],
+    skills:         cv.skills         || EMPTY_SKILLS,
     experience:     cv.experience     || [],
     education:      cv.education      || [],
     certifications: cv.certifications || [],
@@ -99,6 +102,8 @@ cvRouter.put("/api/cv/me", verifyToken, async (req, res) => {
     } = req.body;
 
     // Sanitizar todo el contenido antes de guardar — elimina HTML/scripts
+    // sanitizeDeep es recursivo, así que soporta el objeto anidado
+    // { roles: [], habilidades: [], herramientas: [] } sin cambios.
     const update = {};
     if (personalInfo    !== undefined) update.personalInfo    = sanitizeDeep(personalInfo);
     if (experience      !== undefined) update.experience      = sanitizeDeep(experience);

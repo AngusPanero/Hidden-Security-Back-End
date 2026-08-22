@@ -1,5 +1,7 @@
 const mongoose = require("mongoose");
 
+// Lista plana legacy — la dejo por si /api/skills-list u otra parte del
+// sistema todavía la consume. YA NO se usa para validar vacancy.skills.
 const IT_SKILLS = [
   "JavaScript", "TypeScript", "Python", "Java", "C#", "C++", "Go", "Rust", "PHP", "Ruby",
   "React", "Vue.js", "Angular", "Next.js", "Nuxt.js", "Svelte",
@@ -41,15 +43,12 @@ const vacancySchema = new mongoose.Schema(
       trim: true,
     },
 
+    // Skills requeridas para el puesto — mismo árbol que HS_SKILLS (skills.ts):
+    // áreas/roles, habilidades y herramientas guardadas por separado.
     skills: {
-      type: [String],
-      validate: {
-        validator: (arr) =>
-          arr.every((s) => IT_SKILLS.includes(s)),
-        message: (props) =>
-          `Skill inválida detectada en: ${props.value}`,
-      },
-      default: [],
+      roles:        { type: [String], default: [] },
+      habilidades:  { type: [String], default: [] },
+      herramientas: { type: [String], default: [] },
     },
 
     experienceLevel: {
@@ -153,7 +152,9 @@ vacancySchema.virtual("applicantsCount").get(function () {
 });
 
 vacancySchema.index({ status: 1, createdAt: -1 });
-vacancySchema.index({ skills: 1 });
+vacancySchema.index({ "skills.roles": 1 });
+vacancySchema.index({ "skills.habilidades": 1 });
+vacancySchema.index({ "skills.herramientas": 1 });
 vacancySchema.index({ publishedBy: 1 });
 
 const Vacancy = mongoose.model("Vacancy", vacancySchema);

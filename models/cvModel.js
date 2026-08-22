@@ -62,9 +62,14 @@ const cvSchema = new mongoose.Schema(
     ],
 
     // ── Skills técnicas ────────────────────────────────────────
+    // Basado en el árbol de HS_SKILLS (skills.ts): áreas/roles,
+    // habilidades y herramientas se guardan como arrays de strings
+    // separados. El "grupo" de cada item se resuelve en el frontend
+    // contra el catálogo (no se persiste), así el documento queda liviano.
     skills: {
-      type: [String],
-      default: [],
+      roles:        { type: [String], default: [] },
+      habilidades:  { type: [String], default: [] },
+      herramientas: { type: [String], default: [] },
     },
 
     // ── Idiomas ────────────────────────────────────────────────

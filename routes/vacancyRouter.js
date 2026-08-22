@@ -17,6 +17,20 @@ const VALID_MODALITY   = ["Remoto", "Presencial", "Híbrido"];
 const VALID_CONTRACT   = ["Full-time", "Part-time", "Freelance", "Pasantía"];
 const VALID_STATUS     = ["active", "paused", "closed"];
 const VALID_CURRENCIES = ["USD", "ARS", "EUR", "BRL"];
+const SKILL_BRANCHES   = ["roles", "habilidades", "herramientas"];
+
+// ─── Helper: filtro Mongo para buscar una skill en cualquiera de las 3 ramas ──
+function buildSkillFilter(skill) {
+  const escaped = skill.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const regex   = new RegExp(`^${escaped}$`, "i");
+  return {
+    $or: [
+      { "skills.roles":        { $elemMatch: { $regex: regex } } },
+      { "skills.habilidades":  { $elemMatch: { $regex: regex } } },
+      { "skills.herramientas": { $elemMatch: { $regex: regex } } },
+    ],
+  };
+}
 
 function validateVacancyBody(body, partial = false) {
   const errors = [];
@@ -42,13 +56,22 @@ function validateVacancyBody(body, partial = false) {
     }
   }
 
+  // skills ahora es { roles, habilidades, herramientas } — mismo árbol que HS_SKILLS.
+  // No se valida contra el catálogo completo del lado del servidor (igual criterio
+  // que cvRouter con el CV del usuario) — solo se valida la forma del objeto.
   if (has("skills")) {
-    if (!Array.isArray(body.skills)) {
-      errors.push("skills: debe ser un array");
+    const skills = body.skills;
+    if (typeof skills !== "object" || Array.isArray(skills)) {
+      errors.push("skills: debe ser un objeto { roles, habilidades, herramientas }");
     } else {
-      const invalid = body.skills.filter((s) => !IT_SKILLS.includes(s));
-      if (invalid.length > 0) {
-        errors.push(`skills: valores no permitidos → ${invalid.join(", ")}`);
+      for (const branch of SKILL_BRANCHES) {
+        if (skills[branch] !== undefined) {
+          if (!Array.isArray(skills[branch])) {
+            errors.push(`skills.${branch}: debe ser un array`);
+          } else if (skills[branch].some((s) => typeof s !== "string")) {
+            errors.push(`skills.${branch}: todos los valores deben ser strings`);
+          }
+        }
       }
     }
   }
@@ -157,7 +180,10 @@ vacancyRouter.get("/api/public/vacancies", async (req, res) => {
 
     const filter = { status: "active" };
 
-    if (skill)           filter.skills          = { $elemMatch: { $regex: new RegExp(`^${skill.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") } };
+    if (skill) {
+      if (typeof skill !== "string") return res.status(400).json({ message: "skill debe ser un string" });
+      Object.assign(filter, buildSkillFilter(skill));
+    }
     if (experienceLevel) filter.experienceLevel = experienceLevel;
     if (modality)        filter.modality        = modality;
 
@@ -184,7 +210,8 @@ vacancyRouter.get("/api/public/vacancies", async (req, res) => {
 });
 
 // ─── GET /api/skills-list ─────────────────────────────────────────────────────
-// Accesible para enterprise Y certificados — es una lista estática, no es dato sensible
+// Accesible para enterprise Y certificados — lista estática legacy.
+// No se usa más para validar vacancy.skills (ver validateVacancyBody).
 vacancyRouter.get("/api/skills-list", certifiedMiddleware, async (req, res) => {
   res.json({ skills: IT_SKILLS });
 });
@@ -227,7 +254,7 @@ vacancyRouter.get("/api/vacancies", enterpriseMiddleware, async (req, res) => {
 
     if (skill) {
       if (typeof skill !== "string") return res.status(400).json({ message: "skill debe ser un string" });
-      filter.skills = { $elemMatch: { $regex: new RegExp(`^${skill.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") } };
+      Object.assign(filter, buildSkillFilter(skill));
     }
 
     const skip = (parsedPage - 1) * parsedLimit;
@@ -314,7 +341,7 @@ vacancyRouter.post("/api/vacancy", enterpriseMiddleware, async (req, res) => {
       title:        title.trim(),
       description:  description.trim(),
       requirements: requirements.trim(),
-      skills:       skills || [],
+      skills:       skills || { roles: [], habilidades: [], herramientas: [] },
       experienceLevel,
       modality,
       contractType,
