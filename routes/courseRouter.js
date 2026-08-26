@@ -3,24 +3,9 @@ const courseRouter   = express.Router();
 const CourseProgress = require("../models/CourseSchema");
 const verifyToken    = require("../middleware/authMiddleware");
 const auth           = require("../config/firebase");
+const { COURSES, VALID_COURSE_IDS } = require("../config/courses");
 
 const esProduccion = process.env.NODE_ENV === "production";
-
-// ─── Constantes del curso — fuente de verdad en el backend ───────────────────
-// Nunca vienen del cliente
-const COURSES = {
-  soc1: {
-    totalSteps:   13,
-    passingScore: 0.70,
-    // Índices de los steps que son quiz (0-based)
-    // step 3 = Quiz Módulo 1, step 6 = Quiz Módulo 2,
-    // step 9 = Quiz Módulo 3, step 12 = Quiz Módulo 4
-    quizSteps:    [3, 6, 9, 12],
-    questionsPerQuiz: 20,
-  },
-};
-
-const VALID_COURSE_IDS = Object.keys(COURSES);
 
 // ─── Middleware: verificar plan activo ────────────────────────────────────────
 async function requireActivePlan(req, res, next) {
@@ -64,6 +49,38 @@ function getCourse(courseId, res) {
     return null;
   }
   return COURSES[courseId];
+}
+
+// ─── Helper: otorgar la claim de "usuario certificado" al completar un curso ──
+// Es un booleano — a diferencia del árbol de skills, esto SÍ entra sin
+// problema dentro del límite de 1000 bytes de Firebase custom claims, así
+// que no hace falta derivarlo desde Mongo en cada request. Se escribe una
+// sola vez, en el momento exacto de la transición a completado.
+// Otras partes de la plataforma (certifiedMiddleware) dependen de esta
+// claim para gatear funcionalidad del lado del alumno (aplicar a vacantes,
+// ver notificaciones, etc.) — no confundir con el campo "userCertificated"
+// que arma usersDatabaseRouter.js en su respuesta JSON, que es un valor
+// calculado a partir de skillsCertifiedByHidden y significa algo distinto
+// ("tiene al menos una skill certificada por examen").
+async function grantCertifiedClaim(uid) {
+  try {
+    const userRecord    = await auth.getUser(uid);
+    const currentClaims = userRecord.customClaims || {};
+
+    // Ya la tenía — no hacemos un write innecesario a Firebase
+    if (currentClaims.userCertificated === true) return;
+
+    await auth.setCustomUserClaims(uid, {
+      ...currentClaims,
+      userCertificated: true,
+    });
+
+    console.log(`✅ Claim "userCertificated" activada para ${uid}`);
+  } catch (err) {
+    // No relanzamos: si falla la claim, el progreso del curso ya se guardó
+    // correctamente en Mongo. Queda logueado para revisar manualmente.
+    console.error(`Error otorgando claim userCertificated para ${uid}:`, err.message);
+  }
 }
 
 // ─── GET /api/course/:courseId/progress ──────────────────────────────────────
@@ -123,6 +140,8 @@ courseRouter.patch("/api/course/:courseId/progress/step", verifyToken, requireAc
 
     // Completado cuando todos los steps no-quiz están completados
     // Y todos los quizzes están aprobados
+    const wasCompleted = progress.isCompleted;
+
     const allQuizzesPassed = course.quizSteps.every(qi => {
       const result = progress.quizResults?.[String(qi)];
       return result?.passed === true;
@@ -131,12 +150,22 @@ courseRouter.patch("/api/course/:courseId/progress/step", verifyToken, requireAc
     const totalCompleted = progress.completedSteps.length;
     const allStepsDone   = totalCompleted >= course.totalSteps;
 
-    if (allStepsDone && allQuizzesPassed && !progress.isCompleted) {
+    if (allStepsDone && allQuizzesPassed && !wasCompleted) {
       progress.isCompleted = true;
       progress.completedAt = new Date();
     }
 
     await progress.save();
+
+    // Transición a completado detectada acá también (por si el step que
+    // faltaba era un step normal, no un quiz) — otorgar claim de certificado.
+    // Las skills que otorga el curso (modernSocSkills) NO se escriben acá —
+    // se derivan en tiempo real desde usersDatabaseRouter leyendo isCompleted
+    // directo de Mongo, evitando el límite de 1000 bytes de Firebase.
+    if (!wasCompleted && progress.isCompleted) {
+      await grantCertifiedClaim(userId);
+    }
+
     res.json({ data: progress });
   } catch (err) {
     console.error(esProduccion ? "Error PATCH step" : `Error PATCH step: ${err}`);
@@ -198,6 +227,11 @@ courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, requireAc
       progress = await CourseProgress.create({ userId, courseId });
     }
 
+    // Capturamos el estado ANTES de tocar nada — es lo que nos permite
+    // detectar la transición "recién ahora se completó el curso" más abajo,
+    // sin volver a otorgar la claim en cada intento posterior de quiz.
+    const wasCompleted = progress.isCompleted;
+
     const prevAttempts = progress.quizResults?.[String(stepIndex)]?.attempts ?? 0;
 
     progress.quizResults = {
@@ -225,12 +259,20 @@ courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, requireAc
     });
     const allStepsDone = progress.completedSteps.length >= course.totalSteps;
 
-    if (allStepsDone && allQuizzesPassed && !progress.isCompleted) {
+    if (allStepsDone && allQuizzesPassed && !wasCompleted) {
       progress.isCompleted = true;
       progress.completedAt = new Date();
     }
 
     await progress.save();
+
+    // ── Recién completó el curso en este request → otorgar claim ───────────
+    // Comparamos contra wasCompleted (capturado antes de guardar), así un
+    // reintento de un quiz ya aprobado, o de cualquier otro después de
+    // completado, nunca vuelve a disparar esto.
+    if (!wasCompleted && progress.isCompleted) {
+      await grantCertifiedClaim(userId);
+    }
 
     res.json({
       data:        progress,

@@ -1,14 +1,25 @@
 const express = require("express");
 const usersDatabaseRouter = express.Router();
 const { CV } = require("../models/cvModel");
+const CourseProgress = require("../models/CourseSchema");
 const auth = require("../config/firebase"); // mismo export que usa tu script certifySkills.js
 const enterpriseMiddleware = require("../middleware/enterpriseMiddleware");
+const { COURSES, flattenSkillTree } = require("../config/courses");
 
 const esProduccion = process.env.NODE_ENV === "production";
 
+// ─── Helper: arma un regex tolerante a acentos y mayúsculas ──────────────────
+function buildFlexibleRegex(str) {
+  const escaped = str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const ACCENT_MAP = {
+    a: "[aá]", e: "[eé]", i: "[ií]", o: "[oó]", u: "[uúü]", n: "[nñ]",
+    A: "[AÁ]", E: "[EÉ]", I: "[IÍ]", O: "[OÓ]", U: "[UÚÜ]", N: "[NÑ]",
+  };
+  const flexible = escaped.replace(/[aeiounAEIOUN]/g, ch => ACCENT_MAP[ch]);
+  return new RegExp(flexible, "i");
+}
+
 // ─── Helper: aplana la estructura de skills del CV a un array simple ──────────
-// Soporta el formato nuevo { roles, habilidades, herramientas } y el legacy
-// (array plano), igual que hicimos en el frontend.
 function flattenSkills(skills) {
   if (!skills) return [];
   if (Array.isArray(skills)) return skills; // legacy
@@ -19,10 +30,7 @@ function flattenSkills(skills) {
   ];
 }
 
-// ─── Helper: trae las claims de certificación de Firebase para varios uids ────
-// La fuente de verdad de "qué está certificado" es SIEMPRE Firebase Auth
-// custom claims — nunca Mongo. auth.getUsers() acepta hasta 100 ids por
-// llamada (límite del Admin SDK), por eso lotea.
+// ─── Helper: trae skillsCertifiedByHidden de Firebase para varios uids ────────
 async function getCertifiedSkillsMap(userIds) {
   const map = {};
   const uniqueIds = [...new Set(userIds)].filter(Boolean);
@@ -37,7 +45,7 @@ async function getCertifiedSkillsMap(userIds) {
       result = await auth.getUsers(identifiers);
     } catch (err) {
       console.error(esProduccion ? "Error getUsers batch" : `Error getUsers batch: ${err}`);
-      continue; // ese lote queda sin certificaciones antes que romper todo el request
+      continue;
     }
 
     for (const userRecord of result.users) {
@@ -46,15 +54,37 @@ async function getCertifiedSkillsMap(userIds) {
         ? claims.skillsCertifiedByHidden
         : [];
     }
-    // los uids en result.notFound quedan simplemente sin entrada en el map,
-    // y más abajo se tratan como certifiedSkills: []
   }
 
   return map;
 }
 
+// ─── Helper: deriva las skills otorgadas por cursos completados ───────────────
+async function getCourseSkillsMap(userIds) {
+  const map = {};
+  const uniqueIds = [...new Set(userIds)].filter(Boolean);
+  if (uniqueIds.length === 0) return map;
+
+  const completedProgress = await CourseProgress.find(
+    { userId: { $in: uniqueIds }, isCompleted: true },
+    { userId: 1, courseId: 1 }
+  ).lean();
+
+  for (const uid of uniqueIds) map[uid] = new Set();
+
+  for (const p of completedProgress) {
+    const course = COURSES[p.courseId];
+    if (!course) continue;
+    const skills = flattenSkillTree(course.skillTree);
+    for (const skill of skills) map[p.userId].add(skill);
+  }
+
+  const result = {};
+  for (const uid of uniqueIds) result[uid] = [...map[uid]];
+  return result;
+}
+
 // ─── GET /api/users-database ───────────────────────────────────────────────────
-// Solo empresas — lista de candidatos con filtros combinados (Mongo + Firebase)
 usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req, res) => {
   try {
     const page  = Math.max(1, parseInt(req.query.page)  || 1);
@@ -67,17 +97,25 @@ usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req,
     const availability    = req.query.availability || "";
     const modality        = req.query.modality || "";
 
-    // ── Filtros que Mongo puede resolver directamente ──────────────────────
     const mongoFilter = {};
 
+    // Si hay término de búsqueda, además de filtrar en Mongo por nombre/email/
+    // headline/skills declaradas, necesitamos saber si matchea alguna skill
+    // otorgada por curso — pero esas NO viven en el documento de Mongo, se
+    // calculan en memoria más abajo. Por eso guardamos el regex acá y hacemos
+    // el filtro combinado (Mongo OR curso) después de tener courseSkillsMap.
+    let searchRegex = null;
+
     if (search) {
-      const safe  = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); // escapa regex
-      const regex = new RegExp(safe, "i");
+      searchRegex = buildFlexibleRegex(search);
       mongoFilter.$or = [
-        { "personalInfo.firstName": regex },
-        { "personalInfo.lastName":  regex },
-        { "personalInfo.email":     regex },
-        { "personalInfo.headline":  regex },
+        { "personalInfo.firstName": searchRegex },
+        { "personalInfo.lastName":  searchRegex },
+        { "personalInfo.email":     searchRegex },
+        { "personalInfo.headline":  searchRegex },
+        { "skills.roles":        { $elemMatch: { $regex: searchRegex } } },
+        { "skills.habilidades":  { $elemMatch: { $regex: searchRegex } } },
+        { "skills.herramientas": { $elemMatch: { $regex: searchRegex } } },
       ];
     }
 
@@ -85,8 +123,6 @@ usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req,
     if (modality)      mongoFilter["workPreferences.modality"] = modality;
 
     if (declaredSkills.length > 0) {
-      // cada skill pedida tiene que estar en alguna de las 3 ramas
-      // (o en el array legacy, para candidatos que aún no migraron)
       mongoFilter.$and = (mongoFilter.$and || []).concat(
         declaredSkills.map(skill => ({
           $or: [
@@ -99,17 +135,25 @@ usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req,
       );
     }
 
-    // Traemos todo lo que matchea el filtro de Mongo. El filtro por
-    // certificación depende de Firebase, así que se aplica después,
-    // ANTES de paginar, para que la paginación quede consistente.
-    const allMatches = await CV.find(mongoFilter).lean();
+    // Cuando hay búsqueda por texto, no podemos dejar que Mongo excluya de
+    // entrada a quien solo matchea por una skill de curso (esas no están en
+    // el documento). Por eso, SI hay search, traemos el universo completo
+    // (sin el filtro $or de search) y filtramos en memoria más abajo, una vez
+    // que ya tengamos courseSkillsMap calculado.
+    const mongoFilterForQuery = { ...mongoFilter };
+    if (search) delete mongoFilterForQuery.$or;
 
-    // ── Enriquecer con certificaciones reales de Firebase ───────────────────
+    const allMatches = await CV.find(mongoFilterForQuery).lean();
+
     const userIds = allMatches.map(cv => cv.userId);
-    const certifiedMap = await getCertifiedSkillsMap(userIds);
+    const [certifiedMap, courseSkillsMap] = await Promise.all([
+      getCertifiedSkillsMap(userIds),
+      getCourseSkillsMap(userIds),
+    ]);
 
     let enriched = allMatches.map(cv => {
       const skillsCertifiedByHidden = certifiedMap[cv.userId] || [];
+      const modernSocSkills         = courseSkillsMap[cv.userId] || [];
       return {
         id:                      cv.userId,
         personalInfo:            cv.personalInfo,
@@ -123,11 +167,12 @@ usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req,
         workPreferences:         cv.workPreferences || {},
         updatedAt:               cv.updatedAt,
         skillsCertifiedByHidden,
+        modernSocSkills,
         userCertificated:        skillsCertifiedByHidden.length > 0,
       };
     });
 
-    // ── Filtros que solo se pueden aplicar después de leer Firebase ────────
+    // ── Filtros que solo se pueden aplicar después de leer Firebase/Mongo ──
     if (certifiedOnly) {
       enriched = enriched.filter(c => c.userCertificated);
     }
@@ -136,6 +181,27 @@ usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req,
       enriched = enriched.filter(c =>
         certifiedSkills.every(skill => c.skillsCertifiedByHidden.includes(skill))
       );
+    }
+
+    // Si había término de búsqueda, filtramos acá combinando lo que Mongo ya
+    // sabía resolver (nombre/email/headline/skills declaradas) con las skills
+    // otorgadas por curso — para que "escribir una skill celeste" también
+    // encuentre candidatos, aunque no la hayan declarado en su CV.
+    if (searchRegex) {
+      enriched = enriched.filter(c => {
+        const p = c.personalInfo || {};
+        const matchesBasicFields =
+          searchRegex.test(p.firstName || "") ||
+          searchRegex.test(p.lastName  || "") ||
+          searchRegex.test(p.email     || "") ||
+          searchRegex.test(p.headline  || "");
+
+        const declaredFlat = flattenSkills(c.skills);
+        const matchesDeclared = declaredFlat.some(s => searchRegex.test(s));
+        const matchesCourse   = (c.modernSocSkills || []).some(s => searchRegex.test(s));
+
+        return matchesBasicFields || matchesDeclared || matchesCourse;
+      });
     }
 
     // ── Skills pedidas que nadie tiene, para el warning del frontend ───────
@@ -165,8 +231,6 @@ usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req,
 });
 
 // ─── GET /api/users-database/skills-summary ────────────────────────────────────
-// Universo completo de skills declaradas y certificadas, para poblar los
-// dropdowns de filtro del frontend sin depender de la página actual.
 usersDatabaseRouter.get("/api/users-database/skills-summary", enterpriseMiddleware, async (req, res) => {
   try {
     const allCVs = await CV.find({}, { userId: 1, skills: 1 }).lean();
