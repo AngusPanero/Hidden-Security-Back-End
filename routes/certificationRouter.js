@@ -8,13 +8,19 @@ const { CERTIFICATIONS } = require("../config/certifications");
 
 const esProduccion = process.env.NODE_ENV === "production";
 
+// Motivos de violación aceptados — mantiene el string libre acotado a algo
+// controlado, en vez de dejar que el frontend mande cualquier texto.
+const VALID_VIOLATION_REASONS = [
+  "second_monitor_connected",
+  "duplicate_tab_detected",
+];
+
 function getCert(certId, res) {
   const cert = CERTIFICATIONS[certId];
   if (!cert) { res.status(400).json({ message: "Certificación no válida" }); return null; }
   return cert;
 }
 
-// Lo único que ve el frontend de cada pregunta — nunca el índice correcto
 function sanitizeQuestions(cert) {
   return cert.questions.map(q => ({
     id: q.id, moduleId: q.moduleId, question: q.question, options: q.options,
@@ -39,8 +45,6 @@ function attemptPublicPayload(cert, attempt) {
   };
 }
 
-// Saca UNA ocurrencia de "voucher" del array purchases — mismo patrón que
-// paymentsRouter.js usa para leer/escribir claims (spread + setCustomUserClaims).
 async function consumeVoucher(uid) {
   const userRecord    = await auth.getUser(uid);
   const currentClaims = userRecord.customClaims || {};
@@ -53,8 +57,6 @@ async function consumeVoucher(uid) {
   await auth.setCustomUserClaims(uid, { ...currentClaims, purchases });
 }
 
-// Si falla la creación del intento después de haber consumido el voucher,
-// se lo devolvemos — el alumno no debe perder el ticket por un error nuestro.
 async function refundVoucher(uid) {
   try {
     const userRecord    = await auth.getUser(uid);
@@ -66,10 +68,6 @@ async function refundVoucher(uid) {
   }
 }
 
-// Escribe un evento en el CertificationRecord asociado a un attempt — se usa
-// desde /answer (guardado silencioso) y desde /event (eventos de UI, como
-// cambio de pestaña). No relanza: perder un evento de bitácora no debe
-// romper la experiencia del alumno.
 async function logEvent(attemptId, type, meta = {}) {
   try {
     await CertificationRecord.updateOne(
@@ -81,9 +79,6 @@ async function logEvent(attemptId, type, meta = {}) {
   }
 }
 
-// Cierra automáticamente un intento vencido como reprobado — es lo que
-// impide "empezarlo hoy y seguirlo mañana": si el tiempo pasó, listo.
-// También cierra el CertificationRecord correspondiente con result="expired".
 async function closeIfExpired(attempt, cert) {
   if (attempt.status !== "in_progress") return attempt;
   if (attempt.expiresAt > new Date()) return attempt;
@@ -112,8 +107,6 @@ async function closeIfExpired(attempt, cert) {
 }
 
 // ─── GET /api/certification/:certId/status ────────────────────────────────────
-// Para saber si hay un intento en curso (ej: el alumno refrescó la pantalla
-// durante el examen) sin gastar un voucher nuevo.
 certificationRouter.get("/api/certification/:certId/status", verifyToken, async (req, res) => {
   try {
     const { certId } = req.params;
@@ -139,8 +132,6 @@ certificationRouter.get("/api/certification/:certId/status", verifyToken, async 
 });
 
 // ─── GET /api/certification/:certId/history ───────────────────────────────────
-// Historial de rendiciones propias — para que el alumno vea sus intentos
-// pasados (útil también más adelante para la vista de empresa vía otro router).
 certificationRouter.get("/api/certification/:certId/history", verifyToken, async (req, res) => {
   try {
     const { certId } = req.params;
@@ -148,7 +139,7 @@ certificationRouter.get("/api/certification/:certId/history", verifyToken, async
 
     const records = await CertificationRecord.find(
       { userId: req.user.uid, certId },
-      { events: 0 } // el detalle de eventos no hace falta para el listado
+      { events: 0 }
     ).sort({ createdAt: -1 }).lean();
 
     res.json({ data: records });
@@ -159,14 +150,6 @@ certificationRouter.get("/api/certification/:certId/history", verifyToken, async
 });
 
 // ─── POST /api/certification/:certId/start ────────────────────────────────────
-// ⚠️ FIX aplicado: el chequeo de "intento ya en curso" corre ANTES de exigir
-// voucher. Antes, requireVoucher se ejecutaba como middleware previo a la
-// ruta — así que un alumno que ya gastó su único voucher, empezó el examen
-// y refrescó la página, se topaba con un 403 "SIN_VOUCHER_DISPONIBLE" al
-// intentar reanudar, aunque solo estuviera continuando algo que ya pagó.
-// Ahora: primero se busca si hay un attempt "in_progress" — si lo hay, se
-// devuelve directo, sin tocar el voucher. Solo si es un examen realmente
-// nuevo se valida y consume el voucher.
 certificationRouter.post("/api/certification/:certId/start", verifyToken, async (req, res) => {
   try {
     const { certId } = req.params;
@@ -174,9 +157,6 @@ certificationRouter.post("/api/certification/:certId/start", verifyToken, async 
     const cert = getCert(certId, res);
     if (!cert) return;
 
-    // 1) ¿Hay un intento vigente en curso? Si sí, lo devolvemos tal cual —
-    //    esto cubre el refresh de la pantalla de reglas/examen y NO cobra
-    //    voucher de nuevo.
     let existing = await CertificationAttempt.findOne({ userId: uid, certId, status: "in_progress" });
     if (existing) {
       existing = await closeIfExpired(existing, cert);
@@ -185,8 +165,6 @@ certificationRouter.post("/api/certification/:certId/start", verifyToken, async 
       }
     }
 
-    // 2) Recién acá, si NO hay intento en curso (es un examen nuevo o el
-    //    anterior ya se cerró), se exige y consume el voucher.
     const userRecord = await auth.getUser(uid);
     const claims      = userRecord.customClaims || {};
     const purchases    = Array.isArray(claims.purchases) ? claims.purchases : [];
@@ -210,13 +188,11 @@ certificationRouter.post("/api/certification/:certId/start", verifyToken, async 
         userId: uid, certId, status: "in_progress", startedAt: now, expiresAt,
       });
 
-      // Se crea el registro histórico en paralelo al intento — arranca sin
-      // resultado, se completa en /submit o cuando closeIfExpired lo cierra.
       await CertificationRecord.create({
         userId: uid, certId,
         attemptId: attempt._id,
         startedAt: now,
-        result: "failed", // placeholder hasta que se resuelva — se sobreescribe siempre antes de leerse como final
+        result: "failed", // placeholder — se sobreescribe siempre antes de leerse como final
         totalQuestions:    cert.totalQuestions,
         passingScoreUsed:  cert.passingScore,
         events: [{ type: "started", at: now }],
@@ -234,8 +210,6 @@ certificationRouter.post("/api/certification/:certId/start", verifyToken, async 
 });
 
 // ─── PATCH /api/certification/:certId/answer ──────────────────────────────────
-// Guarda cada respuesta (y el flag "marcada para revisar") al toque — así si
-// se corta la conexión no se pierde lo ya contestado.
 certificationRouter.patch("/api/certification/:certId/answer", verifyToken, async (req, res) => {
   try {
     const { certId } = req.params;
@@ -279,10 +253,6 @@ certificationRouter.patch("/api/certification/:certId/answer", verifyToken, asyn
 });
 
 // ─── POST /api/certification/:certId/event ────────────────────────────────────
-// Eventos de integridad del lado del cliente (cambio de pestaña, pérdida de
-// foco, warning de tiempo mostrado, etc.) — solo se registran en la bitácora,
-// nunca deciden por sí solos aprobar/reprobar (eso lo resuelve /submit con
-// las respuestas reales). Sirve para poder auditar después si hace falta.
 certificationRouter.post("/api/certification/:certId/event", verifyToken, async (req, res) => {
   try {
     const { certId } = req.params;
@@ -298,6 +268,58 @@ certificationRouter.post("/api/certification/:certId/event", verifyToken, async 
   } catch (err) {
     console.error(esProduccion ? "Error POST /event" : `Error POST /event: ${err}`);
     res.status(500).json({ message: "Error al registrar evento" });
+  }
+});
+
+// ─── POST /api/certification/:certId/violation ────────────────────────────────
+// Cancela el examen de forma inmediata por una infracción de integridad
+// (ej: segundo monitor no desconectado dentro de los 30s de gracia). A
+// diferencia de /submit, acá NO se corrigen respuestas — el resultado se
+// fuerza a "failed" con un motivo registrado, y el intento se cierra.
+// El voucher NO se reembolsa: la infracción es responsabilidad del alumno,
+// no un error del sistema (a diferencia de una falla técnica nuestra).
+certificationRouter.post("/api/certification/:certId/violation", verifyToken, async (req, res) => {
+  try {
+    const { certId } = req.params;
+    const { reason } = req.body;
+    const cert = getCert(certId, res);
+    if (!cert) return;
+
+    if (!VALID_VIOLATION_REASONS.includes(reason)) {
+      return res.status(400).json({ message: "Motivo de violación inválido" });
+    }
+
+    const attempt = await CertificationAttempt.findOne({ userId: req.user.uid, certId, status: "in_progress" });
+    if (!attempt) return res.status(404).json({ message: "No hay un examen en curso" });
+
+    const completedAt = new Date();
+
+    attempt.status             = "failed";
+    attempt.score               = 0;
+    attempt.correctCount        = 0;
+    attempt.completedAt         = completedAt;
+    attempt.terminationReason   = reason;
+    await attempt.save();
+
+    await CertificationRecord.updateOne(
+      { attemptId: attempt._id },
+      {
+        $set: {
+          result:             "violation",
+          terminationReason:   reason,
+          completedAt,
+          score:                0,
+          correctCount:         0,
+          durationSeconds:      Math.round((completedAt - attempt.startedAt) / 1000),
+        },
+        $push: { events: { type: "violation", at: completedAt, meta: { reason } } },
+      }
+    );
+
+    res.json({ suspended: true, reason });
+  } catch (err) {
+    console.error(esProduccion ? "Error POST /violation" : `Error POST /violation: ${err}`);
+    res.status(500).json({ message: "Error al procesar la violación de integridad" });
   }
 });
 

@@ -27,6 +27,11 @@ const certificationAttemptSchema = new mongoose.Schema(
     score:        { type: Number, default: null },
     correctCount: { type: Number, default: null },
     completedAt:  { type: Date, default: null },
+
+    // Motivo si el intento terminó por una violación de integridad en vez
+    // de un submit normal — ej: "second_monitor_connected". null en el
+    // caso normal (aprobado, reprobado o expirado por tiempo).
+    terminationReason: { type: String, default: null },
   },
   { timestamps: true }
 );
