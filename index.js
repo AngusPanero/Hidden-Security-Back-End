@@ -14,6 +14,7 @@ const vacancyRouter = require("./routes/vacancyRouter")
 const cvRouter = require("./routes/cvRouter")
 const usersDatabaseRouter = require("./routes/usersDatabaseRouter")
 const notificationRouter = require("./routes/notificationRouter")
+const certificationRouter = require("./routes/certificationRouter")
 const adminMiddleware = require("./middleware/adminMiddleware")
 const enterpriseMiddleware = require("./middleware/enterpriseMiddleware")
 const certifiedMiddleware = require("./middleware/certificatedMiddleware")
@@ -53,6 +54,7 @@ app.use(vacancyRouter)
 app.use(courseRouter)
 app.use(usersDatabaseRouter)
 app.use(notificationRouter)
+app.use(certificationRouter);
 
 app.use((req, res) => {
     res.send(`<h1>404 - Not Found</h1>`)
