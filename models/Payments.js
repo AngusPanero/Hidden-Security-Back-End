@@ -15,6 +15,7 @@ const PaymentsSchema = new mongoose.Schema({
     plan: { type: String, default: "general" },
 
     amount:       { type: Number, required: true },
+    cuotas:       { type: Number, default: 1 },
     mp_payment_id:{ type: String },
     telefono:     { type: String, default: "N/A" },
 
