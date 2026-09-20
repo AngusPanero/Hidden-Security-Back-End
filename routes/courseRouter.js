@@ -216,13 +216,13 @@ courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, requireAc
     // -- Respuestas correctas — fuente de verdad en el backend -----------------
     const CORRECT_ANSWERS = {
       7:  [1,2,2,1,1,2,1,1], // Quiz Módulo 1
-      16: [2,1,2,2,1,1,1,2], // Quiz Módulo 2 (contenido real)
-      26: [1,2,2,1,1,2,1,1], // Quiz Módulo 3 (placeholder = Módulo 1, aún sin quiz real) — TODO: reemplazar
-      34: [1,2,2,1,1,2,1,1], // Quiz Módulo 4 (simulado = mismo contenido que Módulo 1)
-      42: [1,2,2,1,1,2,1,1], // Quiz Módulo 5 (simulado = mismo contenido que Módulo 1)
-      50: [1,2,2,1,1,2,1,1], // Quiz Módulo 6 (simulado = mismo contenido que Módulo 1)
-      58: [1,2,2,1,1,2,1,1], // Quiz Módulo 7 (simulado = mismo contenido que Módulo 1)
-      66: [1,2,2,1,1,2,1,1], // Quiz Módulo 8 (simulado = mismo contenido que Módulo 1)
+      16: [2,1,2,2,1,1,1,2], // Quiz Módulo 2
+      26: [1,1,1,1,1,1,1,1], // Quiz Módulo 3
+      34: [1,2,2,1,1,2,1,1], // Quiz Módulo 4
+      42: [1,2,2,1,1,2,1,1], // Quiz Módulo 5
+      50: [1,2,2,1,1,2,1,1], // Quiz Módulo 6
+      58: [1,2,2,1,1,2,1,1], // Quiz Módulo 7
+      66: [1,2,2,1,1,2,1,1], // Quiz Módulo 8
     };
 
     const correctAnswers = CORRECT_ANSWERS[stepIndex];
