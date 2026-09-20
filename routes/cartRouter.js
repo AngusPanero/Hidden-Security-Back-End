@@ -54,7 +54,7 @@ cartRouter.post("/api/coupons/create", adminMiddleware, async (req, res) => {
     }
 
     if (finalScope === 'plans') {
-        const validPlans = ['starter', 'pro', 'elite', 'voucher', 'b2b_seis', 'b2b_doce'];
+        const validPlans = ['starter', 'pro', 'elite', 'voucher', 'business', 'enterprise'];
         if (!Array.isArray(allowedPlans) || allowedPlans.length === 0) {
             return res.status(400).json({ message: "Debés especificar al menos un plan 🔴" });
         }

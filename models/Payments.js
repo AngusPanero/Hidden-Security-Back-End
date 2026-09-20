@@ -5,6 +5,13 @@ const PaymentsSchema = new mongoose.Schema({
     client_id:  { type: String, required: true },
     email:      { type: String, required: true },
 
+    nombre:        { type: String, default: "N/A" },
+    dni:           { type: String, default: "N/A" },
+    domicilio:     { type: String, default: "N/A" },
+    ciudad:        { type: String, default: "N/A" },
+    provincia:     { type: String, default: "N/A" },
+    codigoPostal:  { type: String, default: "N/A" },
+
     plan: { type: String, default: "general" },
 
     amount:       { type: Number, required: true },
@@ -22,6 +29,8 @@ const PaymentsSchema = new mongoose.Schema({
     date:       { type: Date,   default: Date.now },
 
     expiresAt: { type: Date, default: null },
+
+    isEnterprise: { type: Boolean, default: false },
 
     checked:         { type: Boolean, default: false },
     invoiceSent:     { type: Boolean, default: false },

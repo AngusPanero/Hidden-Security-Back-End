@@ -11,6 +11,15 @@ const auth                 = require("../config/firebase")
 
 const { notifyNewSale } = require("../sseManager/sseManajer")
 
+// ─── Mercado Pago SDK ────────────────────────────────────────────────────────
+const { MercadoPagoConfig, Payment } = require("mercadopago")
+
+const mpClient = new MercadoPagoConfig({
+    accessToken: process.env.MP_ACCESS_TOKEN
+});
+
+const paymentInstance = new Payment(mpClient);
+
 const esProduccion = (process.env.NODE_ENV === 'production');
 
 // ─── Constantes ────────────────────────────────────────────────────────────────
@@ -38,6 +47,30 @@ const BUNDLED_VOUCHERS = {
     'elite': 2,
     'pro':   1,
 };
+
+// Recargo por cuotas — debe reflejar exactamente lo que muestra el checkout
+const INTERES_RATES = { "1": 0, "3": 0.05, "6": 0.10, "12": 0.20 };
+
+// Cuotas sin interés por plan — cada plan define hasta cuántas cuotas no tiene
+// recargo. Si un plan no está listado acá, se asume 1 (sin cuotas sin interés),
+// para no otorgar un beneficio por accidente en planes/promos nuevas.
+const PLAN_CUOTAS_SIN_INTERES = {
+    starter:    6,
+    pro:        6,
+    elite:      6,
+    voucher:    6,
+    business:   6,
+    enterprise: 6,
+};
+
+// Determina cuántas cuotas sin interés aplican para una compra dada:
+// se basa en el plan principal (no el voucher, salvo que la compra sea
+// solo un voucher suelto), así una promo que solo afecte a un plan
+// no cambia el comportamiento de los demás.
+function getCuotasSinInteresParaCompra(items) {
+    const mainItem = items.find(i => i !== 'voucher') || items[0];
+    return PLAN_CUOTAS_SIN_INTERES[mainItem] ?? 1;
+}
 
 // Planes exclusivos por tipo de usuario
 const ENTERPRISE_PLANS = ['business', 'enterprise'];
@@ -104,7 +137,7 @@ paymentsRouter.get("/all-tickets", adminMiddleware, async (req, res) => {
 
 // ─── POST /test-course-payment ─────────────────────────────────────────────────
 paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
-    const { payer, idempotencyKey, items, couponCode } = req.body;
+    const { payer, idempotencyKey, items, couponCode, installments } = req.body;
 
     console.log("🧪 [CURSO_SIMULACIÓN] Iniciando proceso...");
 
@@ -115,9 +148,300 @@ paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
     if (invalidItems.length > 0)
         return res.status(400).json({ message: `Plans inválidos: ${invalidItems.join(', ')} 🔴` });
 
-    const sanitizedEmail = payer.email.trim().toLowerCase();
-    const sanitizedPhone = payer.phone ? payer.phone.trim() : null;
-    const uid            = req.user.uid;
+    const sanitizedEmail        = payer.email.trim().toLowerCase();
+    const sanitizedPhone        = payer.telefono ? payer.telefono.trim() : null;
+    const sanitizedNombre       = payer.nombre ? payer.nombre.trim() : "N/A";
+    const sanitizedDni          = payer.dni ? String(payer.dni).trim() : "N/A";
+    const sanitizedDomicilio    = payer.domicilio ? payer.domicilio.trim() : "N/A";
+    const sanitizedCiudad       = payer.ciudad ? payer.ciudad.trim() : "N/A";
+    const sanitizedProvincia    = payer.provincia ? payer.provincia.trim() : "N/A";
+    const sanitizedCodigoPostal = payer.codigoPostal ? String(payer.codigoPostal).trim() : "N/A";
+    const uid                   = req.user.uid;
+
+    try {
+        const userRecord    = await auth.getUser(uid);
+        const currentClaims = userRecord.customClaims || {};
+
+        const isEnterprise      = !!currentClaims.isEnterprise;
+        const existingPurchases = Array.isArray(currentClaims.purchases) ? currentClaims.purchases : [];
+        const existingExpiry    = currentClaims.purchaseExpiry || {};
+
+        if (isEnterprise) {
+            const forbiddenForEnterprise = items.filter(i => USER_PLANS.includes(i));
+            if (forbiddenForEnterprise.length > 0) {
+                return res.status(403).json({
+                    message:  "TU_TIPO_DE_USUARIO_ESTÁ_INHABILITADO_PARA_ESTA_COMPRA",
+                    detail:   "Las cuentas Enterprise no pueden adquirir planes de estudio individuales.",
+                    code:     "ENTERPRISE_CANNOT_BUY_USER_PLANS",
+                });
+            }
+        }
+
+        if (!isEnterprise) {
+            const forbiddenForUser = items.filter(i => ENTERPRISE_PLANS.includes(i));
+            if (forbiddenForUser.length > 0) {
+                return res.status(403).json({
+                    message:  "TU_TIPO_DE_USUARIO_ESTÁ_INHABILITADO_PARA_ESTA_COMPRA",
+                    detail:   "Los planes B2B son exclusivos para cuentas Enterprise.",
+                    code:     "USER_CANNOT_BUY_ENTERPRISE_PLANS",
+                });
+            }
+        }
+
+        const itemsWithoutVoucher = items.filter(i => i !== 'voucher');
+
+        if (itemsWithoutVoucher.length > 0) {
+            const activePlan = getActivePlan(existingPurchases, existingExpiry);
+            if (activePlan) {
+                const expiresAt  = new Date(existingExpiry[activePlan]);
+                const expiryStr  = expiresAt.toLocaleDateString('es-AR', { day: '2-digit', month: 'long', year: 'numeric' });
+                return res.status(409).json({
+                    message:     "YA_TENÉS_UN_PLAN_ACTIVO",
+                    detail:      `Tu plan ${activePlan.toUpperCase()} está vigente hasta el ${expiryStr}. Podés renovar una vez que finalice.`,
+                    code:        "ACTIVE_PLAN_EXISTS",
+                    activePlan,
+                    expiresAt:   existingExpiry[activePlan],
+                });
+            }
+        }
+
+        const expandedItems = [];
+        for (const item of items) {
+            expandedItems.push(item);
+            if (BUNDLED_VOUCHERS[item]) {
+                const count = BUNDLED_VOUCHERS[item];
+                for (let i = 0; i < count; i++) expandedItems.push('voucher');
+                console.log(`✅ Plan ${item.toUpperCase()} incluye ${count} voucher(s) automático(s).`);
+            }
+        }
+        console.log("📦 Items expandidos:", expandedItems);
+
+        let appliedDiscount     = 0;
+        let couponScope         = null;
+        let couponAllowedPlans  = [];
+
+        if (couponCode) {
+            const sanitizedCode = couponCode.trim().toUpperCase();
+            const coupon = await Coupon.findOne({ code: sanitizedCode, isActive: true });
+
+            if (!coupon)
+                return res.status(404).json({ message: "Cupón no encontrado o inactivo 🔴" });
+
+            if (coupon.type === 'date_limited' && coupon.expiryDate < new Date()) {
+                await Coupon.findByIdAndUpdate(coupon._id, { isActive: false });
+                return res.status(400).json({ message: "El cupón expiró ⚠️" });
+            }
+
+            if (coupon.type === 'single_use' && coupon.usedBy.includes(sanitizedEmail))
+                return res.status(400).json({ message: "Ya usaste este cupón 🔴" });
+
+            if (coupon.type === 'limited_uses') {
+                if (coupon.maxUses !== null && coupon.usesCount >= coupon.maxUses) {
+                    await Coupon.findByIdAndUpdate(coupon._id, { isActive: false });
+                    return res.status(400).json({ message: "El cupón alcanzó su límite de usos ⚠️" });
+                }
+            }
+
+            if (coupon.scope === 'plans') {
+                const applies = items.some(planId => coupon.allowedPlans.includes(planId));
+                if (!applies)
+                    return res.status(400).json({ message: "Este cupón no aplica a ninguno de los planes seleccionados 🔴" });
+            }
+
+            appliedDiscount    = coupon.discount;
+            couponScope        = coupon.scope;
+            couponAllowedPlans = coupon.allowedPlans || [];
+            console.log(`✅ Cupón ${sanitizedCode} válido. Descuento: ${appliedDiscount}%`);
+
+            if (coupon.type === 'single_use') {
+                await Coupon.findByIdAndUpdate(coupon._id, {
+                    $addToSet: { usedBy: sanitizedEmail }, isActive: false
+                });
+            } else if (coupon.type === 'limited_uses') {
+                const updated = await Coupon.findByIdAndUpdate(
+                    coupon._id,
+                    { $addToSet: { usedBy: sanitizedEmail }, $inc: { usesCount: 1 } },
+                    { new: true }
+                );
+                if (updated.maxUses !== null && updated.usesCount >= updated.maxUses)
+                    await Coupon.findByIdAndUpdate(coupon._id, { isActive: false });
+            } else if (coupon.type === 'date_limited') {
+                await Coupon.findByIdAndUpdate(coupon._id, { $addToSet: { usedBy: sanitizedEmail } });
+            }
+
+            console.log(`✅ Cupón ${couponCode.toUpperCase()} consumido.`);
+        }
+
+        const baseAmount = items.reduce((acc, planId) => acc + (PLAN_PRICES[planId] || 0), 0);
+
+        // ── 5b. APLICAR RECARGO POR CUOTAS ─────────────────────────────────────
+        const cuotas = Number(installments) || 1;
+        if (!INTERES_RATES.hasOwnProperty(String(cuotas)))
+            return res.status(400).json({ message: "Cantidad de cuotas inválida 🔴" });
+
+        const cuotasSinInteres = getCuotasSinInteresParaCompra(items);
+        const esGratis    = cuotas <= cuotasSinInteres;
+        const tasaInteres = (cuotas > 1 && !esGratis) ? (INTERES_RATES[String(cuotas)] || 0) : 0;
+        const totalConInteres = baseAmount * (1 + tasaInteres);
+
+        // El descuento del cupón se calcula igual que en el checkout: si el cupón
+        // tiene scope 'plans', solo descuenta sobre los items que están en
+        // allowedPlans (a precio de lista, sin el recargo de cuotas). Si el scope
+        // es 'all' (o cualquier otro que no sea 'plans'), descuenta sobre el total
+        // ya con el recargo de cuotas aplicado.
+        let discountAmount = 0;
+        if (appliedDiscount > 0) {
+            if (couponScope === 'plans') {
+                const discountableBase = items
+                    .filter(i => couponAllowedPlans.includes(i))
+                    .reduce((acc, i) => acc + (PLAN_PRICES[i] || 0), 0);
+                discountAmount = discountableBase * (appliedDiscount / 100);
+            } else {
+                discountAmount = totalConInteres * (appliedDiscount / 100);
+            }
+        }
+
+        const finalAmount = Math.round(totalConInteres - discountAmount);
+
+        console.log(`💰 base: $${baseAmount} | cuotas: ${cuotas} (recargo ${(tasaInteres*100).toFixed(0)}%) | descuento: ${appliedDiscount}% | final: $${finalAmount}`);
+
+        const fakeMPResult = {
+            id:            "fake-course-" + Math.floor(Math.random() * 1000000),
+            status:        "approved",
+            status_detail: "accredited",
+        };
+
+        if (fakeMPResult.status !== "approved")
+            return res.status(402).json({ message: "Pago rechazado", status: fakeMPResult.status });
+
+        const newExpiry = { ...existingExpiry };
+
+        if (isEnterprise) {
+            const planId      = items[0];
+            const expiresAt   = calcExpiresAt(planId);
+            const vacancyLimit = ENTERPRISE_VACANCY_LIMITS[planId];
+
+            newExpiry[planId] = expiresAt.toISOString();
+
+            const updatedPurchases = [
+                ...new Set([...existingPurchases, planId])
+            ];
+
+            await auth.setCustomUserClaims(uid, {
+                ...currentClaims,
+                purchases:       updatedPurchases,
+                purchaseExpiry:  newExpiry,
+                enterprisePlan:       planId,
+                enterprisePlanExpiry: expiresAt.toISOString(),
+                enterprisePurchasedAt: new Date().toISOString(),
+                vacancyLimit,
+                vacanciesUsed: currentClaims.vacanciesUsed ?? 0,
+            });
+
+            console.log(`✅ Enterprise claims para ${uid}: plan=${planId}, vacancyLimit=${vacancyLimit ?? 'ilimitado'}, expiry=${expiresAt.toISOString()}`);
+
+        } else {
+            const nonVoucherExisting = existingPurchases.filter(i => i !== 'voucher');
+            const nonVoucherNew      = expandedItems.filter(i => i !== 'voucher');
+            const voucherCount       = existingPurchases.filter(i => i === 'voucher').length
+                                     + expandedItems.filter(i => i === 'voucher').length;
+
+            const updatedPurchases = [
+                ...new Set([...nonVoucherExisting, ...nonVoucherNew]),
+                ...Array(voucherCount).fill('voucher'),
+            ];
+
+            for (const planId of items) {
+                if (planId === 'voucher') continue;
+                const expiresAt = calcExpiresAt(planId);
+                if (!expiresAt) continue;
+                newExpiry[planId] = expiresAt.toISOString();
+                console.log(`📅 ${planId.toUpperCase()} expira: ${expiresAt.toISOString()}`);
+            }
+
+            await auth.setCustomUserClaims(uid, {
+                ...currentClaims,
+                purchases:      updatedPurchases,
+                purchaseExpiry: newExpiry,
+            });
+
+            console.log(`✅ User claims para ${uid}:`, updatedPurchases);
+        }
+
+        const mainPlan    = items.find(i => i !== 'voucher') || items[0];
+        const dbExpiresAt = calcExpiresAt(mainPlan);
+
+        const nuevoPago = new PaymentsMongo({
+            orderId:       idempotencyKey || `TEST-COURSE-${Date.now()}`,
+            client_id:     uid,
+            nombre:        sanitizedNombre,
+            dni:           sanitizedDni,
+            email:         sanitizedEmail,
+            telefono:      sanitizedPhone,
+            domicilio:     sanitizedDomicilio,
+            ciudad:        sanitizedCiudad,
+            provincia:     sanitizedProvincia,
+            codigoPostal:  sanitizedCodigoPostal,
+            plan:          items.join('+'),
+            amount:        finalAmount,
+            mp_payment_id: fakeMPResult.id,
+            status:        fakeMPResult.status,
+            couponUsed:    couponCode ? couponCode.toUpperCase() : null,
+            discount:      appliedDiscount,
+            date:          new Date(),
+            expiresAt:     dbExpiresAt,
+            isEnterprise,
+        });
+
+        await nuevoPago.save();
+        notifyNewSale(nuevoPago);
+        console.log("✅ Pago guardado en DB.");
+
+        return res.status(200).json({
+            message:        "Simulación completada con éxito 🟢",
+            mp_status:      fakeMPResult.status,
+            mp_id:          fakeMPResult.id,
+            purchases:      isEnterprise ? [items[0]] : undefined,
+            purchaseExpiry: newExpiry,
+            discount:       appliedDiscount > 0 ? `${appliedDiscount}%` : null,
+            amount:         finalAmount,
+            ...(isEnterprise && {
+                enterprisePlan:  items[0],
+                vacancyLimit:    ENTERPRISE_VACANCY_LIMITS[items[0]],
+            }),
+        });
+
+    } catch (error) {
+        console.error("❌ [SIMULACIÓN ERROR]:", error.message);
+        return res.status(500).json({ error: "Error en la simulación", details: error.message });
+    }
+});
+
+// ─── POST /course-payment — COBRO REAL CON MERCADO PAGO 
+paymentsRouter.post("/course-payment", verifyToken, async (req, res) => {
+    const { payer, idempotencyKey, items, couponCode, token, issuer_id, payment_method_id, installments } = req.body;
+
+    console.log("💳 [CURSO_PAGO_REAL] Iniciando proceso...");
+
+    if (!payer?.email || !items || !Array.isArray(items) || items.length === 0)
+        return res.status(400).json({ message: "Faltan datos: payer.email e items son requeridos 🔴" });
+
+    if (!token || !payment_method_id || !installments)
+        return res.status(400).json({ message: "Faltan datos de pago (token, payment_method_id, installments) 🔴" });
+
+    const invalidItems = items.filter(i => !VALID_PLANS.includes(i));
+    if (invalidItems.length > 0)
+        return res.status(400).json({ message: `Plans inválidos: ${invalidItems.join(', ')} 🔴` });
+
+    const sanitizedEmail        = payer.email.trim().toLowerCase();
+    const sanitizedPhone        = payer.telefono ? payer.telefono.trim() : null;
+    const sanitizedNombre       = payer.nombre ? payer.nombre.trim() : "N/A";
+    const sanitizedDni          = payer.dni ? String(payer.dni).trim() : "N/A";
+    const sanitizedDomicilio    = payer.domicilio ? payer.domicilio.trim() : "N/A";
+    const sanitizedCiudad       = payer.ciudad ? payer.ciudad.trim() : "N/A";
+    const sanitizedProvincia    = payer.provincia ? payer.provincia.trim() : "N/A";
+    const sanitizedCodigoPostal = payer.codigoPostal ? String(payer.codigoPostal).trim() : "N/A";
+    const uid                   = req.user.uid;
 
     try {
         // ── 1. LEER CLAIMS ACTUALES ────────────────────────────────────────────
@@ -185,7 +509,9 @@ paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
         console.log("📦 Items expandidos:", expandedItems);
 
         // ── 5. VALIDAR Y CONSUMIR CUPÓN ───────────────────────────────────────
-        let appliedDiscount = 0;
+        let appliedDiscount     = 0;
+        let couponScope         = null;
+        let couponAllowedPlans  = [];
 
         if (couponCode) {
             const sanitizedCode = couponCode.trim().toUpperCase();
@@ -215,7 +541,9 @@ paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
                     return res.status(400).json({ message: "Este cupón no aplica a ninguno de los planes seleccionados 🔴" });
             }
 
-            appliedDiscount = coupon.discount;
+            appliedDiscount    = coupon.discount;
+            couponScope        = coupon.scope;
+            couponAllowedPlans = coupon.allowedPlans || [];
             console.log(`✅ Cupón ${sanitizedCode} válido. Descuento: ${appliedDiscount}%`);
 
             if (coupon.type === 'single_use') {
@@ -238,22 +566,73 @@ paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
         }
 
         // ── 6. CALCULAR MONTO ─────────────────────────────────────────────────
-        const baseAmount  = items.reduce((acc, planId) => acc + (PLAN_PRICES[planId] || 0), 0);
-        const finalAmount = appliedDiscount > 0
-            ? Math.round(baseAmount * (1 - appliedDiscount / 100))
-            : baseAmount;
+        const baseAmount = items.reduce((acc, planId) => acc + (PLAN_PRICES[planId] || 0), 0);
 
-        console.log(`💰 base: $${baseAmount} | descuento: ${appliedDiscount}% | final: $${finalAmount}`);
+        // ── 6b. APLICAR RECARGO POR CUOTAS ─────────────────────────────────────
+        const cuotas = Number(installments) || 1;
+        if (!INTERES_RATES.hasOwnProperty(String(cuotas)))
+            return res.status(400).json({ message: "Cantidad de cuotas inválida 🔴" });
 
-        // ── 7. SIMULAR MP ─────────────────────────────────────────────────────
-        const fakeMPResult = {
-            id:            "fake-course-" + Math.floor(Math.random() * 1000000),
-            status:        "approved",
-            status_detail: "accredited",
-        };
+        const cuotasSinInteres = getCuotasSinInteresParaCompra(items);
+        const esGratis    = cuotas <= cuotasSinInteres;
+        const tasaInteres = (cuotas > 1 && !esGratis) ? (INTERES_RATES[String(cuotas)] || 0) : 0;
+        const totalConInteres = baseAmount * (1 + tasaInteres);
 
-        if (fakeMPResult.status !== "approved")
-            return res.status(402).json({ message: "Pago rechazado", status: fakeMPResult.status });
+        // El descuento del cupón se calcula igual que en el checkout: si el cupón
+        // tiene scope 'plans', solo descuenta sobre los items que están en
+        // allowedPlans (a precio de lista, sin el recargo de cuotas). Si el scope
+        // es 'all' (o cualquier otro que no sea 'plans'), descuenta sobre el total
+        // ya con el recargo de cuotas aplicado.
+        let discountAmount = 0;
+        if (appliedDiscount > 0) {
+            if (couponScope === 'plans') {
+                const discountableBase = items
+                    .filter(i => couponAllowedPlans.includes(i))
+                    .reduce((acc, i) => acc + (PLAN_PRICES[i] || 0), 0);
+                discountAmount = discountableBase * (appliedDiscount / 100);
+            } else {
+                discountAmount = totalConInteres * (appliedDiscount / 100);
+            }
+        }
+
+        const finalAmount = Math.round(totalConInteres - discountAmount);
+
+        console.log(`💰 base: $${baseAmount} | cuotas: ${cuotas} (recargo ${(tasaInteres*100).toFixed(0)}%) | descuento: ${appliedDiscount}% | final: $${finalAmount}`);
+
+        // ── 7. PROCESAR PAGO REAL EN MERCADO PAGO ─────────────────────────────
+        let mpResult;
+        try {
+            const paymentData = {
+                body: {
+                    transaction_amount: Math.round(finalAmount),
+                    token,
+                    description: "Hidden Security - " + items.join('+'),
+                    installments: Number(installments),
+                    payment_method_id,
+                    issuer_id: issuer_id ? String(issuer_id) : undefined,
+                    payer: {
+                        email: sanitizedEmail,
+                        identification: payer.identification,
+                    },
+                },
+                requestOptions: {
+                    idempotencyKey: idempotencyKey,
+                }
+            };
+
+            mpResult = await paymentInstance.create(paymentData);
+        } catch (mpError) {
+            console.error(esProduccion ? "Error MP" : "Error MP:", mpError.response?.data || mpError.message);
+            return res.status(500).json({ message: "Error al procesar el pago con Mercado Pago 🔴" });
+        }
+
+        if (mpResult.status !== "approved") {
+            return res.status(402).json({
+                message:       "Pago rechazado",
+                status:        mpResult.status,
+                status_detail: mpResult.status_detail,
+            });
+        }
 
         // ── 8. FIREBASE CUSTOM CLAIMS ─────────────────────────────────────────
         const newExpiry = { ...existingExpiry };
@@ -319,14 +698,20 @@ paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
         const dbExpiresAt = calcExpiresAt(mainPlan);
 
         const nuevoPago = new PaymentsMongo({
-            orderId:       idempotencyKey || `TEST-COURSE-${Date.now()}`,
+            orderId:       idempotencyKey || `COURSE-${Date.now()}`,
             client_id:     uid,
+            nombre:        sanitizedNombre,
+            dni:           sanitizedDni,
             email:         sanitizedEmail,
             telefono:      sanitizedPhone,
+            domicilio:     sanitizedDomicilio,
+            ciudad:        sanitizedCiudad,
+            provincia:     sanitizedProvincia,
+            codigoPostal:  sanitizedCodigoPostal,
             plan:          items.join('+'),
             amount:        finalAmount,
-            mp_payment_id: fakeMPResult.id,
-            status:        fakeMPResult.status,
+            mp_payment_id: String(mpResult.id),
+            status:        mpResult.status,
             couponUsed:    couponCode ? couponCode.toUpperCase() : null,
             discount:      appliedDiscount,
             date:          new Date(),
@@ -340,9 +725,9 @@ paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
 
         // ── 10. RESPUESTA ─────────────────────────────────────────────────────
         return res.status(200).json({
-            message:        "Simulación completada con éxito 🟢",
-            mp_status:      fakeMPResult.status,
-            mp_id:          fakeMPResult.id,
+            message:        "Pago procesado con éxito 🟢",
+            mp_status:      mpResult.status,
+            mp_id:          mpResult.id,
             purchases:      isEnterprise ? [items[0]] : undefined,
             purchaseExpiry: newExpiry,
             discount:       appliedDiscount > 0 ? `${appliedDiscount}%` : null,
@@ -354,8 +739,8 @@ paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
         });
 
     } catch (error) {
-        console.error("❌ [SIMULACIÓN ERROR]:", error.message);
-        return res.status(500).json({ error: "Error en la simulación", details: error.message });
+        console.error("❌ [PAGO_REAL ERROR]:", error.message);
+        return res.status(500).json({ error: "Error al procesar el pago", details: error.message });
     }
 });
 

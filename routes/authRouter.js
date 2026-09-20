@@ -193,9 +193,6 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
 
         // 2. Verificar el token obtenido y obtener claims
         const decoded = await auth.verifyIdToken(idToken);
-        console.log("DECODED ADMIN:", decoded.admin);
-        console.log("DECODED EMAIL:", decoded.email);
-        console.log("ALL CLAIMS:", JSON.stringify(decoded));
 
         // 3. Control de Baneo
         if (decoded.banned) {

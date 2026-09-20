@@ -1,6 +1,6 @@
 const mongoose = require('mongoose');
 
-const VALID_PLANS = ['starter', 'pro', 'elite', 'voucher', 'b2b_seis', 'b2b_doce'];
+const VALID_PLANS = ['starter', 'pro', 'elite', 'voucher', 'business', 'enterprise'];
 
 const CouponSchema = new mongoose.Schema({
     code:     { type: String, required: true, unique: true, uppercase: true, trim: true },
