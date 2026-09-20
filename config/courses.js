@@ -1,16 +1,22 @@
-// MODERN SOC CONFIG
-const SOC1_MODULE_SIZE  = 8; // 7 PDFs + 1 quiz por módulo
-const SOC1_MODULE_COUNT = 8; // 8 módulos totales
+const SOC1_MODULE_SIZES = [8, 9, 10, 8, 8, 8, 8, 8];
 
-const soc1QuizSteps = Array.from(
-  { length: SOC1_MODULE_COUNT },
-  (_, i) => (i + 1) * SOC1_MODULE_SIZE - 1
-); // → [7, 15, 23, 31, 39, 47, 55, 63]
+// El quiz de cada módulo es siempre su último step — se calcula acumulando
+// los tamaños de SOC1_MODULE_SIZES en orden.
+const soc1QuizSteps = [];
+let soc1Cursor = 0;
+for (const size of SOC1_MODULE_SIZES) {
+  soc1Cursor += size;
+  soc1QuizSteps.push(soc1Cursor - 1);
+}
+// → [7, 16, 26, 34, 42, 50, 58, 66]
+
+const soc1TotalSteps = SOC1_MODULE_SIZES.reduce((sum, size) => sum + size, 0);
+// → 67
 
 const COURSES = {
   soc1: {
-    totalSteps:       SOC1_MODULE_SIZE * SOC1_MODULE_COUNT, // 64
-    quizSteps:        soc1QuizSteps,                         // [7,15,23,31,39,47,55,63]
+    totalSteps:       soc1TotalSteps, // 67
+    quizSteps:        soc1QuizSteps,  // [7,16,26,34,42,50,58,66]
     questionsPerQuiz: 8,
     passingScore:     0.70,
   },

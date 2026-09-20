@@ -214,22 +214,15 @@ courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, requireAc
     }
 
     // -- Respuestas correctas — fuente de verdad en el backend -----------------
-    // Índices de quiz recalculados para el árbol nuevo: 8 módulos, cada uno
-    // con 7 PDFs + 1 quiz de 8 preguntas — el quiz siempre es el último step
-    // del módulo (N*8 - 1), igual que calcula config/courses.js.
-    // Los 8 módulos usan hoy el MISMO contenido simulado (MODULO_1_QUIZ_QUESTIONS
-    // en soc1Course.tsx) — por eso las 8 entradas tienen el mismo array de
-    // respuestas. Reemplazá cada entrada por las respuestas reales de cada
-    // módulo a medida que tengas su contenido definitivo.
     const CORRECT_ANSWERS = {
       7:  [1,2,2,1,1,2,1,1], // Quiz Módulo 1
-      15: [1,2,2,1,1,2,1,1], // Quiz Módulo 2 (simulado = mismo contenido que Módulo 1)
-      23: [1,2,2,1,1,2,1,1], // Quiz Módulo 3 (simulado = mismo contenido que Módulo 1)
-      31: [1,2,2,1,1,2,1,1], // Quiz Módulo 4 (simulado = mismo contenido que Módulo 1)
-      39: [1,2,2,1,1,2,1,1], // Quiz Módulo 5 (simulado = mismo contenido que Módulo 1)
-      47: [1,2,2,1,1,2,1,1], // Quiz Módulo 6 (simulado = mismo contenido que Módulo 1)
-      55: [1,2,2,1,1,2,1,1], // Quiz Módulo 7 (simulado = mismo contenido que Módulo 1)
-      63: [1,2,2,1,1,2,1,1], // Quiz Módulo 8 (simulado = mismo contenido que Módulo 1)
+      16: [2,1,2,2,1,1,1,2], // Quiz Módulo 2 (contenido real)
+      26: [1,2,2,1,1,2,1,1], // Quiz Módulo 3 (placeholder = Módulo 1, aún sin quiz real) — TODO: reemplazar
+      34: [1,2,2,1,1,2,1,1], // Quiz Módulo 4 (simulado = mismo contenido que Módulo 1)
+      42: [1,2,2,1,1,2,1,1], // Quiz Módulo 5 (simulado = mismo contenido que Módulo 1)
+      50: [1,2,2,1,1,2,1,1], // Quiz Módulo 6 (simulado = mismo contenido que Módulo 1)
+      58: [1,2,2,1,1,2,1,1], // Quiz Módulo 7 (simulado = mismo contenido que Módulo 1)
+      66: [1,2,2,1,1,2,1,1], // Quiz Módulo 8 (simulado = mismo contenido que Módulo 1)
     };
 
     const correctAnswers = CORRECT_ANSWERS[stepIndex];

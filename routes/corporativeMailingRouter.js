@@ -5,11 +5,6 @@ const { BrevoClient } = require("@getbrevo/brevo");
 const esProduccion = process.env.NODE_ENV === "production";
 
 // -- BREVO CLIENT --------------------------------------------------
-// Mismo cliente que en mailRouter.js. Se declara aca tambien porque este
-// archivo se mantiene self-contained (no importa nada de mailRouter.js).
-console.log("[corporativeMailingRouter] BREVO_API_KEY presente:", !!process.env.BREVO_API_KEY);
-console.log("[corporativeMailingRouter] EMAIL_FROM:", process.env.EMAIL_FROM);
-
 const brevo = new BrevoClient({ apiKey: process.env.BREVO_API_KEY });
 
 async function sendMail({ to, subject, html, attachments = [] }) {

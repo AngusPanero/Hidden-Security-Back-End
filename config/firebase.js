@@ -19,9 +19,6 @@ const userService = {
             credential: admin.credential.cert(userService),
         });
         console.log(`Firebase: connected successfully! 🟢`);
-        console.log("PRIVATE_KEY_START:", process.env.FIREBASE_PRIVATE_KEY?.substring(0, 50));
-        console.log("PRIVATE_KEY_HAS_NEWLINES:", process.env.FIREBASE_PRIVATE_KEY?.includes('\n'));
-        console.log("PRIVATE_KEY_HAS_LITERAL_N:", process.env.FIREBASE_PRIVATE_KEY?.includes('\\n'));
     }
     
 const auth = admin.auth()
