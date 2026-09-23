@@ -865,54 +865,71 @@ paymentsRouter.post("/course-payment", verifyToken, async (req, res) => {
 paymentsRouter.post("/webhooks/mercadopago", async (req, res) => {
     const type   = req.query.type || req.body?.type || req.query.topic;
     const dataId = req.query['data.id'] || req.body?.data?.id || req.query.id;
-
+ 
+    console.log(`📩 Webhook MP recibido: type=${type ?? '-'} | id=${dataId ?? '-'}`);
+ 
     // ── 1. Solo eventos de pago (el resto: 200 para que MP no reintente) ──────
     if (type !== 'payment' || !dataId) return res.sendStatus(200);
-
+ 
     // ── 2. Firma ──────────────────────────────────────────────────────────────
     if (!verifyMpSignature(req, dataId)) {
         console.warn("⚠️ Webhook MP con firma inválida");
         return res.sendStatus(401);
     }
-
+ 
     try {
         // ── 3. Estado real del pago (nunca confiar en el body) ────────────────
-        const mpPayment = await paymentInstance.get({ id: dataId });
-        const orderId   = mpPayment.external_reference;
-
-        if (!orderId) return res.sendStatus(200); // pago viejo o ajeno a este flujo
-
+        let mpPayment;
+        try {
+            mpPayment = await paymentInstance.get({ id: dataId });
+        } catch (e) {
+            // Pago inexistente (p. ej. id ficticio de una simulación): 200 para que MP no reintente
+            if ((e?.status ?? e?.response?.status) === 404) {
+                console.warn(`⚠️ Webhook MP: el pago ${dataId} no existe en MP, se ignora`);
+                return res.sendStatus(200);
+            }
+            throw e;
+        }
+ 
+        const orderId = mpPayment.external_reference;
+ 
+        if (!orderId) {
+            // Pago viejo, simulado o ajeno a este flujo
+            console.log(`ℹ️ Webhook MP: pago ${dataId} sin external_reference, se ignora`);
+            return res.sendStatus(200);
+        }
+ 
         // ── 4. Buscar la orden ────────────────────────────────────────────────
         const order = await PaymentsMongo.findOne({ orderId });
         if (!order) {
             console.warn(`⚠️ Webhook MP: sin orden para external_reference ${orderId}`);
             return res.sendStatus(200);
         }
-
+ 
         // ── 5. Chequear monto ─────────────────────────────────────────────────
         if (Math.round(Number(mpPayment.transaction_amount)) !== Math.round(order.amount)) {
             console.error(`❌ Webhook MP: monto no coincide en orden ${orderId} (MP ${mpPayment.transaction_amount} vs orden ${order.amount})`);
             await PaymentsMongo.updateOne({ _id: order._id }, { $set: { amountMismatch: true } });
             return res.sendStatus(200);
         }
-
+ 
         // ── 6. Actualizar estado ──────────────────────────────────────────────
         order.mp_payment_id = String(mpPayment.id);
         order.status        = mpPayment.status;
         order.status_detail = mpPayment.status_detail ?? null;
         await order.save();
-
+ 
         console.log(`🔔 Webhook MP: orden ${orderId} → ${mpPayment.status}`);
-
+ 
         // ── 7. Si quedó aprobado, activar ─────────────────────────────────────
         if (mpPayment.status === 'approved') {
             const result = await fulfillOrder(order._id);
             // 500 → MP reintenta más tarde
             if (!result.ok) return res.sendStatus(500);
         }
-
+ 
         return res.sendStatus(200);
-
+ 
     } catch (error) {
         console.error("❌ [WEBHOOK MP ERROR]:", error.message);
         return res.sendStatus(500);
