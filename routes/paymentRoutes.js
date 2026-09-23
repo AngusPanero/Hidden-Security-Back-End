@@ -340,15 +340,75 @@ function verifyMpSignature(req, dataId) {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  TICKETS
 // ═══════════════════════════════════════════════════════════════════════════════
+// Estados que el usuario ve en su historial ('created' y 'error' son internos)
+const TICKET_STATUSES = [
+    'approved', ...PENDING_STATUSES,
+    'rejected', 'failed', 'cancelled', 'refunded', 'charged_back', 'in_mediation',
+];
 
-// ─── Tickets del usuario (solo los propios) ────────────────────────────────────
+// Traduce el status_detail de MP a un código propio para el front.
+// El detalle crudo de Mercado Pago nunca sale del backend.
+const TICKET_REASON_MAP = {
+    cc_rejected_insufficient_amount:      'insufficient_funds',
+    cc_rejected_bad_filled_security_code: 'bad_cvv',
+    cc_rejected_bad_filled_date:          'bad_expiry',
+    cc_rejected_bad_filled_card_number:   'bad_card_number',
+    cc_rejected_bad_filled_other:         'bad_data',
+    cc_rejected_call_for_authorize:       'call_for_authorize',
+    cc_rejected_card_disabled:            'card_disabled',
+    cc_rejected_high_risk:                'high_risk',
+    cc_rejected_blacklist:                'high_risk',
+    cc_rejected_max_attempts:             'max_attempts',
+    cc_rejected_duplicated_payment:       'duplicated',
+    cc_rejected_card_error:               'card_error',
+    cc_rejected_other_reason:             'bank_rejected',
+    pending_contingency:                  'processing',
+    pending_review_manual:                'manual_review',
+};
+
+// Arma el ticket que ve el cliente: sin ids de MP, sin datos internos
+// de activación y sin datos personales que el historial no necesita.
+function toTicket(p) {
+    const items = Array.isArray(p.items) && p.items.length > 0
+        ? p.items
+        : String(p.plan || '').split('+').filter(Boolean); // pagos viejos sin `items`
+
+    const status = PENDING_STATUSES.includes(p.status) ? 'pending'
+                 : p.status === 'failed'               ? 'rejected'
+                 : p.status;
+
+    const reason = p.status === 'failed'
+        ? 'request_rejected'
+        : (TICKET_REASON_MAP[p.status_detail] ?? null);
+
+    return {
+        id:          String(p._id),
+        reference:   String(p.orderId || '').replace(/-/g, '').slice(-8).toUpperCase(),
+        date:        p.date || p.createdAt,
+        items,
+        subtotal:    items.reduce((acc, i) => acc + (PLAN_PRICES[i] || 0), 0),
+        amount:      p.amount,
+        cuotas:      p.cuotas ?? 1,
+        couponCode:  p.couponUsed || null,
+        discount:    p.discount || 0,
+        status,
+        reason,
+        // Pagos viejos no tienen `fulfillment`: se asumen activados
+        activated:   status === 'approved' && (!p.fulfillment || p.fulfillment === 'done'),
+        expiresAt:   p.expiresAt || null,
+        invoiceSent: !!p.invoiceSent,
+        isTest:      !!p.isTest,
+    };
+}
+
 paymentsRouter.get("/tickets", verifyToken, async (req, res) => {
     try {
         const payments = await PaymentsMongo
-            .find({ client_id: req.user.uid, status: { $in: VISIBLE_STATUSES } })
+            .find({ client_id: req.user.uid, status: { $in: TICKET_STATUSES } })
             .sort({ date: -1 })
-            .select('-__v');
-        return res.status(200).json(payments);
+            .select('orderId date createdAt items plan amount cuotas couponUsed discount status status_detail fulfillment expiresAt invoiceSent isTest')
+            .lean();
+        return res.status(200).json(payments.map(toTicket));
     } catch (error) {
         console.error("Error getting tickets!", error);
         return res.status(500).json({ message: "Error getting tickets! 🔴" });
