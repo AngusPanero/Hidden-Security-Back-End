@@ -209,7 +209,7 @@ async function consumeCoupon(code, email) {
         const updated = await Coupon.findByIdAndUpdate(
             coupon._id,
             { $addToSet: { usedBy: email }, $inc: { usesCount: 1 } },
-            { new: true }
+            { returnDocument: 'after' }
         );
         if (updated.maxUses !== null && updated.usesCount >= updated.maxUses)
             await Coupon.updateOne({ _id: coupon._id }, { $set: { isActive: false } });
@@ -239,7 +239,7 @@ async function fulfillOrder(orderMongoId) {
             ],
         },
         { $set: { fulfillment: 'processing', fulfillmentStartedAt: new Date() } },
-        { new: true }
+        { returnDocument: 'after' }
     );
 
     if (!order) {
