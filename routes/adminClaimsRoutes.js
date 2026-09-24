@@ -94,7 +94,7 @@ function validateLogoUrl(value) {
     }
 }
 
-// ─── Middleware: re-chequear admin contra Firebase ───────────────────────────
+// ─── Middleware: re-chequear admin contra Firebase ───────────────────
 // No confiamos en lo que trae el token/cookie: leemos el usuario en vivo.
 async function requireFreshAdmin(req, res, next) {
     const uid = req.user?.uid;
