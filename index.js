@@ -15,6 +15,7 @@ const usersDatabaseRouter = require("./routes/usersDatabaseRouter")
 const notificationRouter = require("./routes/notificationRouter")
 const certificationRouter = require("./routes/certificationRouter")
 const corporativeMailingRouter = require("./routes/corporativeMailingRouter")
+const adminClaimsRouter = require("./routes/adminClaimsRouter")
 const adminMiddleware = require("./middleware/adminMiddleware")
 const enterpriseMiddleware = require("./middleware/enterpriseMiddleware")
 const certifiedMiddleware = require("./middleware/certificatedMiddleware")
@@ -55,6 +56,7 @@ app.use(usersDatabaseRouter)
 app.use(notificationRouter)
 app.use(certificationRouter);
 app.use(corporativeMailingRouter);
+app.use(adminClaimsRouter);
 
 app.use((req, res) => {
     res.send(`<h1>404 - Not Found</h1>`)
