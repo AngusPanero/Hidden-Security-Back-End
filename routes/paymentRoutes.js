@@ -418,14 +418,17 @@ paymentsRouter.get("/tickets", verifyToken, async (req, res) => {
 paymentsRouter.get("/all-tickets", adminMiddleware, async (req, res) => {
     try {
         const allPayments = await PaymentsMongo
-            .find({ status: { $in: VISIBLE_STATUSES } })
-            .sort({ createdAt: -1 });
-        if (!allPayments || allPayments.length === 0)
-            return res.status(404).json({ message: "No sales records found! 🔴" });
+            .find({})
+            .sort({ createdAt: -1 })
+            .limit(5000)
+            .select('-__v')
+            .lean();
+
+        // Lista vacía = 200 con [], no 404 (no es un error)
         return res.status(200).json(allPayments);
     } catch (error) {
         console.error("Error fetching all tickets!", error);
-        res.status(500).json({ message: "Internal Server Error 🔴" });
+        return res.status(500).json({ message: "Internal Server Error 🔴" });
     }
 });
 

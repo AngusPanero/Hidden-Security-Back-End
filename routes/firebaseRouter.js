@@ -22,7 +22,8 @@ firebaseRouter.get("/admin/users", adminMiddleware, async (req, res) => {
             // Verificamos si tiene el claim de banned
             isBanned: userRecord.customClaims?.banned || false,
             isAdmin: userRecord.customClaims?.admin || false,
-            isEnterprise: userRecord.customClaims?. isEnterprise || false
+            isEnterprise: userRecord.customClaims?. isEnterprise || false,
+            isPartner:    userRecord.customClaims?.partner      || false,
         }));
 
         res.status(200).json(users);
