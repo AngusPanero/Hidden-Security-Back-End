@@ -15,7 +15,7 @@ const usersDatabaseRouter = require("./routes/usersDatabaseRouter")
 const notificationRouter = require("./routes/notificationRouter")
 const certificationRouter = require("./routes/certificationRouter")
 const corporativeMailingRouter = require("./routes/corporativeMailingRouter")
-const adminClaimsRouter = require("./routes/adminClaimsRouter")
+const adminClaimsRouter = require("./routes/adminClaimsRoutes")
 const adminMiddleware = require("./middleware/adminMiddleware")
 const enterpriseMiddleware = require("./middleware/enterpriseMiddleware")
 const certifiedMiddleware = require("./middleware/certificatedMiddleware")
@@ -28,6 +28,7 @@ const PORT = process.env.PORT
 
 app.set('trust proxy', 1); // Para el Rate Limiter
 app.use(urlencoded({ extended: true }))
+
 app.use(express.json())
 app.use(cookieParser())
 
