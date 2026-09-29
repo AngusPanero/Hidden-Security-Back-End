@@ -4,6 +4,7 @@ const vacancyRouter  = express.Router();
 const { Vacancy, IT_SKILLS } = require("../models/vacancyModel");
 const enterpriseMiddleware  = require("../middleware/enterpriseMiddleware");
 const certifiedMiddleware   = require("../middleware/certificatedMiddleware");
+const authMiddleware        = require("../middleware/authMiddleware");
 const { notifyNewApplicant } = require("../sseManager/sseApplicants");
 const { notifyUser, userSseHandler } = require("../sseManager/sseUserNotifications");
 const { CV }                         = require("../models/cvModel");
@@ -454,8 +455,11 @@ vacancyRouter.patch("/api/vacancy/:id/status", enterpriseMiddleware, async (req,
   }
 });
 
+
+const REQUIRE_CERTIFICATION =  false; // Cambiar a true si se requiere certificación para aplicar a vacantes
+const applyGuard = REQUIRE_CERTIFICATION ? certifiedMiddleware : authMiddleware;
 // ─── GET /api/user/applications ──────────────────────────────────────────────
-vacancyRouter.get("/api/user/applications", certifiedMiddleware, async (req, res) => {
+vacancyRouter.get("/api/user/applications", applyGuard, async (req, res) => {
   try {
     const vacancies = await Vacancy.find(
       { "applicants.userId": req.user.uid },
@@ -477,7 +481,7 @@ vacancyRouter.get("/api/user/applications", certifiedMiddleware, async (req, res
 });
 
 // ─── PATCH /api/vacancy/:id/applicants ───────────────────────────────────────
-vacancyRouter.patch("/api/vacancy/:id/applicants", certifiedMiddleware, async (req, res) => {
+vacancyRouter.patch("/api/vacancy/:id/applicants", applyGuard, async (req, res) => {
   try {
     const userId      = req.user.uid;
     const { consent } = req.body;

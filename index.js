@@ -19,6 +19,7 @@ const adminClaimsRouter = require("./routes/adminClaimsRoutes")
 const adminMiddleware = require("./middleware/adminMiddleware")
 const enterpriseMiddleware = require("./middleware/enterpriseMiddleware")
 const certifiedMiddleware = require("./middleware/certificatedMiddleware")
+const authMiddleware = require("./middleware/authMiddleware")
 const { sseHandler } = require("./sseManager/sseManajer")
 const { applicantSseHandler } = require("./sseManager/sseApplicants")
 const { userSseHandler } = require("./sseManager/sseUserNotifications");
@@ -43,7 +44,12 @@ app.use(cors({
 
 app.get("/api/payments/stream", adminMiddleware, sseHandler);
 app.get("/api/vacancy/applicants/stream", enterpriseMiddleware, applicantSseHandler);
-app.get("/api/user/notifications/stream", certifiedMiddleware, userSseHandler);
+
+const REQUIRE_CERTIFICATION = false; // Cambiar a true si se requiere certificación para aplicar a vacantes
+const applyGuard = REQUIRE_CERTIFICATION ? certifiedMiddleware : authMiddleware;
+
+app.get("/api/user/notifications/stream", applyGuard, userSseHandler);
+app.get("/api/user/notifications/stream", applyGuard, userSseHandler);
 
 app.use(cvRouter)
 app.use(authRouter)
