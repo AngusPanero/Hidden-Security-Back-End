@@ -125,16 +125,31 @@ const REQUEST_TYPE_LABELS = {
 };
 
 // -- POST /request ------------------------------------------------
-// Recibe el formulario de solicitud de acceso (Empresa / Trainee-Sponsor)
-// desde Pricing.tsx y te lo reenvía a vos (EMAIL_FROM) con el mismo diseño
-// visual que el resto de los mailings del sistema.
+/// Escapa los datos del formulario antes de meterlos en el HTML del mail,
+// para que nadie pueda inyectar etiquetas o links desde los campos.
+const escapeHtml = (value) =>
+    String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+
+// Teléfono: solo dígitos, espacios, +, -, paréntesis y puntos; entre 7 y 15 dígitos reales
+const PHONE_ALLOWED = /^\+?[\d\s\-().]+$/;
+const isValidPhone = (phone) => {
+    const value = String(phone).trim();
+    const digits = value.replace(/\D/g, "");
+    return PHONE_ALLOWED.test(value) && digits.length >= 7 && digits.length <= 15;
+};
+
 corporativeMailingRouter.post("/corporate-mailing/request", async (req, res) => {
     console.log("[POST /request] body recibido:", req.body);
 
-    const { requestType, email, fullName, company, country } = req.body;
+    const { requestType, email, fullName, phone, company, country } = req.body;
 
-    if (!requestType || !email || !fullName || !company || !country) {
-        console.log("[POST /request] faltan campos:", { requestType, email, fullName, company, country });
+    if (!requestType || !email || !fullName || !phone || !company || !country) {
+        console.log("[POST /request] faltan campos:", { requestType, email, fullName, phone, company, country });
         return res.status(400).json({ message: "All required fields must be filled! 🔴" });
     }
 
@@ -143,9 +158,25 @@ corporativeMailingRouter.post("/corporate-mailing/request", async (req, res) => 
         return res.status(400).json({ message: "Invalid requestType! 🔴" });
     }
 
+    if (!isValidPhone(phone)) {
+        console.log("[POST /request] teléfono inválido:", phone);
+        return res.status(400).json({ message: "Ingresá un teléfono válido, con código de área." });
+    }
+
     const requestTypeLabel = REQUEST_TYPE_LABELS[requestType];
     const destinatario = process.env.EMAIL_FROM;
     console.log("[POST /request] voy a enviar a:", destinatario, "| tipo:", requestTypeLabel);
+
+    // Valores ya escapados para el HTML
+    const safe = {
+        fullName: escapeHtml(fullName),
+        email:    escapeHtml(email),
+        phone:    escapeHtml(String(phone).trim()),
+        company:  escapeHtml(company),
+        country:  escapeHtml(country),
+    };
+    // Para el link tel: solo + y dígitos
+    const phoneHref = String(phone).trim().replace(/[^\d+]/g, "");
 
     try {
         await sendMail({
@@ -186,7 +217,7 @@ corporativeMailingRouter.post("/corporate-mailing/request", async (req, res) => 
                                     <p style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(255,255,255,0.3); margin:0;">NOMBRE</p>
                                 </td>
                                 <td style="padding:6px 0; border-bottom:1px solid rgba(204,255,0,0.08);">
-                                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; font-weight:700; color:#ffffff; margin:0;">${fullName}</p>
+                                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; font-weight:700; color:#ffffff; margin:0;">${safe.fullName}</p>
                                 </td>
                             </tr>
                             <tr>
@@ -194,7 +225,17 @@ corporativeMailingRouter.post("/corporate-mailing/request", async (req, res) => 
                                     <p style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(255,255,255,0.3); margin:0;">EMAIL_CORPORATIVO</p>
                                 </td>
                                 <td style="padding:6px 0; border-bottom:1px solid rgba(204,255,0,0.08);">
-                                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; font-weight:700; color:#ccff00; margin:0;">${email}</p>
+                                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; font-weight:700; color:#ccff00; margin:0;">${safe.email}</p>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td style="padding:6px 0; border-bottom:1px solid rgba(204,255,0,0.08);">
+                                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(255,255,255,0.3); margin:0;">TELÉFONO</p>
+                                </td>
+                                <td style="padding:6px 0; border-bottom:1px solid rgba(204,255,0,0.08);">
+                                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; font-weight:700; margin:0;">
+                                        <a href="tel:${phoneHref}" style="color:#ccff00; text-decoration:none;">${safe.phone}</a>
+                                    </p>
                                 </td>
                             </tr>
                             <tr>
@@ -202,7 +243,7 @@ corporativeMailingRouter.post("/corporate-mailing/request", async (req, res) => 
                                     <p style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(255,255,255,0.3); margin:0;">EMPRESA</p>
                                 </td>
                                 <td style="padding:6px 0; border-bottom:1px solid rgba(204,255,0,0.08);">
-                                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; font-weight:700; color:#ffffff; margin:0;">${company}</p>
+                                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; font-weight:700; color:#ffffff; margin:0;">${safe.company}</p>
                                 </td>
                             </tr>
                             <tr>
@@ -210,7 +251,7 @@ corporativeMailingRouter.post("/corporate-mailing/request", async (req, res) => 
                                     <p style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(255,255,255,0.3); margin:0;">PAÍS</p>
                                 </td>
                                 <td style="padding:6px 0;">
-                                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; font-weight:700; color:#ffffff; margin:0;">${country}</p>
+                                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; font-weight:700; color:#ffffff; margin:0;">${safe.country}</p>
                                 </td>
                             </tr>
                         </table>
