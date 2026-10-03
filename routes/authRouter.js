@@ -390,7 +390,7 @@ authRouter.post("/logout", async (req, res) => {
             path: "/" 
         });
 
-       /*  res.clearCookie("idToken", {
+        /* res.clearCookie("idToken", {
             httpOnly: true,
             sameSite: "none",
             secure: true,

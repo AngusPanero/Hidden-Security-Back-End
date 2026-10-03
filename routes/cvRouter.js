@@ -3,6 +3,9 @@ const cvRouter = express.Router();
 const { CV } = require("../models/cvModel");
 const verifyToken = require("../middleware/authMiddleware");
 const enterpriseMiddleware = require("../middleware/enterpriseMiddleware");
+const CourseProgress = require("../models/CourseSchema");
+const auth = require("../config/firebase");
+const { COURSES, flattenSkillTree } = require("../config/courses");
 
 const esProduccion = process.env.NODE_ENV === "production";
 
@@ -72,6 +75,38 @@ function formatCVForEnterprise(cv) {
       }),
     },
     updatedAt: cv.updatedAt,
+  };
+}
+
+// ─── Helper: validaciones de Hidden para un candidato ─────────────────────────
+// Duplicado a propósito de usersDatabaseRouter — se unifica al sumar otro curso.
+// - skillsCertifiedByHidden: examen controlado (claims de Firebase)
+// - modernSocSkills: skills de cursos completados (CourseProgress en Mongo)
+async function getCandidateValidations(userId) {
+  let skillsCertifiedByHidden = [];
+  try {
+    const userRecord = await auth.getUser(userId);
+    const claims = userRecord.customClaims || {};
+    if (Array.isArray(claims.skillsCertifiedByHidden)) {
+      skillsCertifiedByHidden = claims.skillsCertifiedByHidden;
+    }
+  } catch (err) {
+    console.error(esProduccion ? "Error leyendo claims del candidato" : `Error leyendo claims de ${userId}: ${err.message}`);
+  }
+
+  const completed = await CourseProgress.find(
+    { userId, isCompleted: true },
+    { courseId: 1 }
+  ).lean();
+
+  const modernSocSkills = [...new Set(
+    completed.flatMap(p => flattenSkillTree(COURSES[p.courseId]?.skillTree))
+  )];
+
+  return {
+    skillsCertifiedByHidden,
+    modernSocSkills,
+    userCertificated: skillsCertifiedByHidden.length > 0,
   };
 }
 
@@ -149,7 +184,10 @@ cvRouter.get("/api/cv/user/:userId", enterpriseMiddleware, async (req, res) => {
   try {
     const cv = await CV.findOne({ userId: req.params.userId }).lean();
     if (!cv) return res.status(404).json({ message: "CV no encontrado" });
-    res.json({ data: formatCVForEnterprise(cv) });
+
+    // Se suman las skills certificadas por examen y las validadas por curso
+    const validations = await getCandidateValidations(req.params.userId);
+    res.json({ data: { ...formatCVForEnterprise(cv), ...validations } });
   } catch (err) {
     console.error(esProduccion ? "Error GET /cv/user/:userId" : `Error GET /cv/user/:userId: ${err}`);
     res.status(500).json({ message: "Error al obtener el CV" });
