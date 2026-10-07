@@ -54,3 +54,5 @@ clearAllCustomClaims.js
 certifySkills.js
 makePartner.js
 certifySocCertif.js
+setPlanExpiry.js
+listClaims.js

@@ -346,15 +346,33 @@ certificationRouter.get("/api/certification/summary", verifyToken, async (req, r
     const records = await findCountedRecords(req.user.uid); // una sola consulta para todas
     const data = {};
     for (const [certId, cert] of Object.entries(CERTIFICATIONS)) {
-      data[certId] = summarizeRecords(
+      const summary = summarizeRecords(
         records.filter(r => r.certId === certId && isCurrentExamRecord(r, cert)),
         cert.passingScore
       );
+      // Nombre visible + skill que otorga, para badges y modales del front
+      data[certId] = summary ? { ...summary, title: cert.title, certifiedSkill: cert.certifiedSkill } : null;
     }
     res.json({ data });
   } catch (err) {
     console.error(esProduccion ? "Error GET /summary" : `Error GET /summary: ${err}`);
     res.status(500).json({ message: "Error al obtener resultados" });
+  }
+});
+
+// ─── GET /api/certification/my-skills ────────────────────────────────────
+// Lee skillsCertifiedByHidden DIRECTO de Firebase (no de la cookie de sesión,
+// que puede tener claims viejas). Responde { data: ["SOC Analyst", ...] }.
+certificationRouter.get("/api/certification/my-skills", verifyToken, async (req, res) => {
+  try {
+    const { customClaims = {} } = await auth.getUser(req.user.uid);
+    const skills = Array.isArray(customClaims.skillsCertifiedByHidden)
+      ? customClaims.skillsCertifiedByHidden.filter(s => typeof s === "string" && s.trim())
+      : [];
+    res.json({ data: skills });
+  } catch (err) {
+    console.error(esProduccion ? "Error GET /my-skills" : `Error GET /my-skills: ${err}`);
+    res.status(500).json({ message: "Error al obtener skills certificadas" });
   }
 });
 
