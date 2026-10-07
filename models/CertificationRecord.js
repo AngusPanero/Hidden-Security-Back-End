@@ -21,25 +21,49 @@ const certificationRecordSchema = new mongoose.Schema(
     // "violation": el examen se canceló por una infracción de integridad
     // detectada mientras se rendía (ej. segundo monitor no desconectado
     // dentro de los 30s de gracia) — distinto de "failed" (respondió mal)
-    // o "expired" (se acabó el tiempo).
+    // o "expired" (se acabó el tiempo y no llegó al mínimo).
+    // "abandoned": intento del motor viejo cerrado al migrar (voucher devuelto).
     result: {
       type: String,
       enum: ["passed", "failed", "expired", "abandoned", "violation"],
       required: true,
     },
 
+    // score = puntos obtenidos / puntos posibles (ponderado)
     score:        { type: Number, default: null },
-    correctCount: { type: Number, default: null },
+    pointsEarned: { type: Number, default: null },
+    maxPoints:    { type: Number, default: null },
+    correctCount: { type: Number, default: null }, // respuestas con puntaje completo
     totalQuestions: { type: Number, required: true },
     passingScoreUsed: { type: Number, required: true },
     durationSeconds:  { type: Number, default: null },
 
-    // Motivo puntual cuando result==="violation" — ej: "second_monitor_connected"
+    // Desglose por módulo (incluye "Casos SJT" y "Casos Exploratorios")
+    byModule: {
+      type: [{
+        _id:     false,
+        module:  String,
+        correct: Number,
+        total:   Number,
+        score:   Number,
+      }],
+      default: [],
+    },
+
+    // Motivo de cierre: "submitted", "time_expired", "legacy_engine" o la
+    // violación puntual cuando result==="violation" (ej: "second_monitor_connected")
     terminationReason: { type: String, default: null },
 
+    // Claim skillsCertifiedByHidden — solo se completa si result === "passed".
+    // Si Firebase falla al otorgarlo, claimGrantedAt queda null y se
+    // reintenta automáticamente en el próximo GET /status del alumno.
+    certifiedSkill: { type: String, default: null },
+    claimGrantedAt: { type: Date, default: null },
+
     // Bitácora de eventos del examen. type ejemplos: "started", "tab_hidden",
-    // "tab_visible", "answer_saved", "flag_toggled", "time_warning_shown",
-    // "submitted", "auto_expired", "second_monitor_detected_during_exam",
+    // "tab_visible", "answer_saved", "flag_toggled", "review_started",
+    // "time_warning_shown", "submitted", "auto_expired", "claim_granted",
+    // "claim_grant_failed", "second_monitor_detected_during_exam",
     // "second_monitor_disconnected", "second_monitor_kicked_to_device_check".
     events: {
       type: [{
