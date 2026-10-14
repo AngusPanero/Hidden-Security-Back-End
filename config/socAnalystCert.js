@@ -1,8 +1,3 @@
-/* ══════════════════════════════════════════════════════════════════════════
-   Certificación SOC Analyst — configuración
-   El banco (socAnalystBank.json) se genera con scripts/buildSocAnalystBank.js
-   y contiene las respuestas correctas: NUNCA se expone por ninguna ruta.
-══════════════════════════════════════════════════════════════════════════ */
 const bank = require("../bancoPreguntasCertif/socAnalystBank.json");
 
 const bp = bank.blueprint;

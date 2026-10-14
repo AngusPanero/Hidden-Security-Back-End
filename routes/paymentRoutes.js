@@ -51,17 +51,17 @@ const BUNDLED_VOUCHERS = {
 };
 
 // Recargo por cuotas — debe reflejar exactamente lo que muestra el checkout
-const INTERES_RATES = { "1": 0, "3": 0.05, "6": 0.10, "12": 0.20 };
+const INTERES_RATES = { "1": 0, "3": 0.15, "6": 0.30, "12": 0.65 };
 
 // Cuotas sin interés por plan. Si un plan no está listado se asume 1,
 // para no otorgar un beneficio por accidente en planes/promos nuevas.
 const PLAN_CUOTAS_SIN_INTERES = {
-    starter:    6,
-    pro:        6,
-    elite:      6,
-    voucher:    6,
-    business:   6,
-    enterprise: 6,
+    starter:    1,
+    pro:        1,
+    elite:      1,
+    voucher:    1,
+    business:   1,
+    enterprise: 1,
 };
 
 // Planes exclusivos por tipo de usuario

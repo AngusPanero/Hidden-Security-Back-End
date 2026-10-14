@@ -27,7 +27,6 @@ const engine           = require("../services/socExamEngine");
   }
 })();
 
-const esProduccion = process.env.NODE_ENV === "production";
 
 // Motivos de violación aceptados — mantiene el string libre acotado a algo
 // controlado, en vez de dejar que el frontend mande cualquier texto.

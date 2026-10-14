@@ -15,6 +15,9 @@ const axios = require("axios")
 // BREVO
 const { BrevoClient } = require("@getbrevo/brevo");
 
+// Entorno
+const esProduccion = process.env.NODE_ENV === "production";
+
 const brevo = new BrevoClient({ apiKey: process.env.BREVO_API_KEY });
  
 async function sendVerificationEmail(email) {
@@ -230,21 +233,23 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
         });
 
         // 6. Configurar Cookie
-        res.cookie("idToken", idToken, {
-            httpOnly: true,
-            sameSite: "lax",
-            secure: true,
-            domain: ".hidden-security.org",
-            maxAge: 60 * 60 * 1000,
-            path: "/"
-        });
-
-        /* res.cookie("idToken", idToken, {
-            httpOnly: true,
-            sameSite: "none",
-            secure: true,
-            path: "/" 
-        }); */
+        if (esProduccion) {
+            res.cookie("idToken", idToken, {
+                httpOnly: true,
+                sameSite: "lax",
+                secure: true,
+                domain: ".hidden-security.org",
+                maxAge: 60 * 60 * 1000,
+                path: "/"
+            });
+        } else {
+            res.cookie("idToken", idToken, {
+                httpOnly: true,
+                sameSite: "none",
+                secure: true,
+                path: "/" 
+            });
+        }
 
         // ── Objeto de usuario propio — nunca mandar decoded directo ──────────
         const userPayload = {
@@ -382,20 +387,22 @@ authRouter.post("/logout", async (req, res) => {
             });
         }
 
-        res.clearCookie("idToken", {
-            httpOnly: true,
-            sameSite: "lax",
-            secure: true,
-            domain: ".hidden-security.org",
-            path: "/" 
-        });
-
-        /* res.clearCookie("idToken", {
-            httpOnly: true,
-            sameSite: "none",
-            secure: true,
-            path: "/" 
-        }); */
+        if(esProduccion){
+            res.clearCookie("idToken", {
+                httpOnly: true,
+                sameSite: "lax",
+                secure: true,
+                domain: ".hidden-security.org",
+                path: "/" 
+            });
+        } else{
+            res.clearCookie("idToken", {
+                httpOnly: true,
+                sameSite: "none",
+                secure: true,
+                path: "/" 
+            });
+        }
 
         return res.status(200).json({ message: "Logout audited! 🟢" })
     } catch (error) {
