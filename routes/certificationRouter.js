@@ -12,7 +12,7 @@ const engine           = require("../services/socExamEngine");
 // rompería DESPUÉS de consumir el voucher. Mejor fallar al bootear.
 (function assertModels() {
   const need = {
-    CertificationAttempt: [CertificationAttempt, ["sequence", "optionOrder", "phase", "currentIndex", "reviewQueue", "reviewIndex", "pointsEarned"]],
+    CertificationAttempt: [CertificationAttempt, ["sequence", "optionOrder", "phase", "currentIndex", "reviewQueue", "reviewIndex", "pointsEarned", "focusStrikes", "leftAt", "leftTab"]],
     CertificationRecord:  [CertificationRecord,  ["byModule", "certifiedSkill", "claimGrantedAt", "pointsEarned"]],
   };
   const missing = [];
@@ -33,12 +33,25 @@ const engine           = require("../services/socExamEngine");
 const VALID_VIOLATION_REASONS = [
   "second_monitor_connected",
   "duplicate_tab_detected",
+  "fullscreen_exit_confirmed", // confirmó los 2 avisos de salir de pantalla completa
+  "tab_close_confirmed",       // confirmó los 2 avisos de cerrar la pestaña (Ctrl+W)
+];
+// "focus_limit_reached" y "tab_closed" NO van en esa lista: los decide solo
+// el servidor (/strike y resolveLeftTab), el front no puede mandarlos.
+
+// ── Integridad: salidas del examen ──────────────────────────────────────────
+// Salidas permitidas (minimizar, cambiar de ventana/pestaña, salir de pantalla
+// completa, capturas, extensiones inyectadas). A la última se cancela.
+const MAX_FOCUS_STRIKES  = 3;
+const VALID_STRIKE_KINDS = [
+  "fullscreen_exit", "tab_hidden", "window_blur", "screenshot", "extension_injected",
 ];
 
 // Eventos que solo puede escribir el servidor (el front no puede falsificarlos).
 const RESERVED_EVENT_TYPES = [
   "started", "submitted", "auto_expired", "violation", "answer_saved",
   "flag_toggled", "review_started", "claim_granted", "claim_grant_failed",
+  "focus_strike", "page_reloaded", "page_unloaded", "tab_closed_confirmed",
 ];
 
 // Margen para la latencia de red: una respuesta/entrega que sale del navegador
@@ -71,6 +84,8 @@ function attemptPublicPayload(cert, attempt) {
     timeLimitMinutes:           cert.timeLimitMinutes,
     showConfetti:               cert.showConfetti,
     confettiColors:             cert.confettiColors,
+    focusStrikes:               attempt.focusStrikes ?? 0, // "SALIDAS 1/3" al retomar
+    maxFocusStrikes:            MAX_FOCUS_STRIKES,
     view: engine.buildView(cert.bank, attempt),
   };
 }
@@ -156,7 +171,7 @@ async function findInProgress(uid, certId) {
   const closed = await CertificationAttempt.findOneAndUpdate(
     { _id: attempt._id, status: "in_progress" },
     { $set: { status: "failed", completedAt: new Date(), terminationReason: "legacy_engine" } },
-    { new: true }
+    { returnDocument: 'after' }
   );
   if (closed) {
     await CertificationRecord.updateOne(
@@ -259,7 +274,7 @@ async function finalizeAttempt(cert, attempt, { timedOut = false } = {}) {
         terminationReason: timedOut ? "time_expired" : "submitted",
       },
     },
-    { new: true }
+    { returnDocument: 'after' }
   );
 
   let history = null;
@@ -300,6 +315,63 @@ async function closeIfExpired(attempt, cert) {
   return CertificationAttempt.findById(attempt._id);
 }
 
+// ─── Cierre por violación (único lugar) ──────────────────────────────────
+// No corrige respuestas: resultado 0, motivo registrado, voucher NO se
+// devuelve. Idempotente: si otro request ya lo cerró, devuelve el actual.
+async function closeAsViolation(attempt, reason) {
+  const completedAt = new Date();
+  const closed = await CertificationAttempt.findOneAndUpdate(
+    { _id: attempt._id, status: "in_progress" },
+    { $set: { status: "failed", score: 0, correctCount: 0, completedAt, terminationReason: reason } },
+    { returnDocument: 'after' }
+  );
+  if (!closed) return CertificationAttempt.findById(attempt._id);
+
+  await CertificationRecord.updateOne(
+    { attemptId: closed._id },
+    {
+      $set: {
+        result:            "violation",
+        terminationReason: reason,
+        completedAt,
+        score:             0,
+        correctCount:      0,
+        durationSeconds:   Math.round((completedAt - closed.startedAt) / 1000),
+      },
+      $push: { events: { type: "violation", at: completedAt, meta: { reason } } },
+    }
+  );
+  return closed;
+}
+
+// ─── Aviso de cierre de pestaña pendiente (leftAt) ───────────────────────
+// El front manda /leave (sendBeacon) cuando la página se descarga DESPUÉS de
+// que el alumno confirmó el aviso del navegador. Se decide cuando vuelve:
+//  - misma pestaña (recarga)       → sigue, cuenta como salida
+//  - otra pestaña / otro navegador → cerró a propósito → violación "tab_closed"
+//  - sin aviso (corte de luz)      → no se toca, se retoma normalmente
+async function resolveLeftTab(attempt, tab) {
+  if (!attempt?.leftAt || attempt.status !== "in_progress") return attempt;
+  if (!tab) return attempt; // cliente sin id de pestaña: no se decide nada
+
+  if (attempt.leftTab && tab === attempt.leftTab) {
+    const updated = await CertificationAttempt.findOneAndUpdate(
+      { _id: attempt._id, status: "in_progress", leftAt: { $ne: null } },
+      { $set: { leftAt: null, leftTab: null }, $inc: { focusStrikes: 1 } },
+      { returnDocument: 'after' }
+    );
+    if (!updated) return CertificationAttempt.findById(attempt._id);
+    await logEvent(updated._id, "page_reloaded", { strikes: updated.focusStrikes });
+    if (updated.focusStrikes >= MAX_FOCUS_STRIKES) return closeAsViolation(updated, "focus_limit_reached");
+    return updated;
+  }
+
+  await logEvent(attempt._id, "tab_closed_confirmed", { leftAt: attempt.leftAt });
+  return closeAsViolation(attempt, "tab_closed");
+}
+
+const tabFrom = (v) => String(v || "").slice(0, 64);
+
 // ─── GET /api/certification/:certId/status ───────────────────────────────
 certificationRouter.get("/api/certification/:certId/status", verifyToken, async (req, res) => {
   try {
@@ -318,6 +390,12 @@ certificationRouter.get("/api/certification/:certId/status", verifyToken, async 
     let attempt = await findInProgress(req.user.uid, certId);
     // previous = intentos anteriores (para mostrar "ya rendiste" antes de gastar otro voucher)
     if (!attempt) return res.json({ inProgress: false, previous: await previousOf() });
+
+    // Recarga vs. pestaña cerrada a propósito (ver resolveLeftTab)
+    attempt = await resolveLeftTab(attempt, tabFrom(req.query.tab));
+    if (attempt.status !== "in_progress" && attempt.terminationReason !== "time_expired" && attempt.terminationReason !== "submitted") {
+      return res.json({ inProgress: false, suspended: true, reason: attempt.terminationReason, previous: await previousOf() });
+    }
 
     attempt = await closeIfExpired(attempt, cert);
     if (attempt.status !== "in_progress") {
@@ -403,6 +481,11 @@ certificationRouter.post("/api/certification/:certId/start", verifyToken, async 
 
     let existing = await findInProgress(uid, certId);
     if (existing) {
+      existing = await resolveLeftTab(existing, tabFrom(req.body?.tab));
+      if (existing.status !== "in_progress" && existing.terminationReason !== "time_expired" && existing.terminationReason !== "submitted") {
+        // Cerrado por violación: nunca se arranca uno nuevo en silencio (consumiría otro voucher)
+        return res.status(409).json({ code: "ATTEMPT_CLOSED", reason: existing.terminationReason });
+      }
       existing = await closeIfExpired(existing, cert);
       if (existing.status === "in_progress") {
         return res.json(attemptPublicPayload(cert, existing));
@@ -524,7 +607,7 @@ certificationRouter.patch("/api/certification/:certId/answer", verifyToken, asyn
     const saved = await CertificationAttempt.findOneAndUpdate(
       { _id: attempt._id, status: "in_progress", ...filter },
       update,
-      { new: true }
+      { returnDocument: 'after' }
     );
     if (!saved) return res.status(409).json({ message: "Esa pregunta ya no puede modificarse", code: "LOCKED" });
 
@@ -567,7 +650,7 @@ certificationRouter.post("/api/certification/:certId/next", verifyToken, async (
     const saved = await CertificationAttempt.findOneAndUpdate(
       { _id: attempt._id, status: "in_progress", phase: "exam", currentIndex: attempt.currentIndex },
       update,
-      { new: true }
+      { returnDocument: 'after' }
     );
     const fresh = saved || await CertificationAttempt.findById(attempt._id);
     if (saved && isLast) logEvent(attempt._id, "review_started", { flagged: attempt.flagged.length });
@@ -597,7 +680,7 @@ certificationRouter.post("/api/certification/:certId/review/goto", verifyToken, 
     const saved = await CertificationAttempt.findOneAndUpdate(
       { _id: attempt._id, status: "in_progress", phase: "review" },
       { $set: { reviewIndex: index } },
-      { new: true }
+      { returnDocument: 'after' }
     );
     res.json({ view: engine.buildView(cert.bank, saved || attempt) });
   } catch (err) {
@@ -644,35 +727,87 @@ certificationRouter.post("/api/certification/:certId/violation", verifyToken, as
       return res.status(400).json({ message: "Motivo de violación inválido" });
     }
 
-    const completedAt = new Date();
-    const attempt = await CertificationAttempt.findOneAndUpdate(
-      { userId: req.user.uid, certId, status: "in_progress" },
-      { $set: { status: "failed", score: 0, correctCount: 0, completedAt, terminationReason: reason } },
-      { new: true }
-    );
+    const attempt = await CertificationAttempt.findOne({ userId: req.user.uid, certId, status: "in_progress" });
     if (!attempt) return res.status(404).json({ message: "No hay un examen en curso" });
 
-    await CertificationRecord.updateOne(
-      { attemptId: attempt._id },
-      {
-        $set: {
-          result:            "violation",
-          terminationReason: reason,
-          completedAt,
-          score:             0,
-          correctCount:      0,
-          durationSeconds:   Math.round((completedAt - attempt.startedAt) / 1000),
-        },
-        $push: { events: { type: "violation", at: completedAt, meta: { reason } } },
-      }
-    );
-
+    await closeAsViolation(attempt, reason);
     res.json({ suspended: true, reason });
   } catch (err) {
     console.error(esProduccion ? "Error POST /violation" : `Error POST /violation: ${err}`);
     res.status(500).json({ message: "Error al procesar la violación de integridad" });
   }
 });
+
+// ─── POST /api/certification/:certId/strike ──────────────────────────────
+// Una salida del examen. El contador vive en el servidor (recargar no lo
+// resetea) y a la última se cancela acá mismo, sin depender del front.
+// Body: { kind }
+certificationRouter.post("/api/certification/:certId/strike", verifyToken, async (req, res) => {
+  try {
+    const { certId } = req.params;
+    const cert = getCert(certId, res);
+    if (!cert) return;
+
+    const kind = VALID_STRIKE_KINDS.includes(req.body?.kind) ? req.body.kind : "unknown";
+
+    const attempt = await loadActiveAttempt(req, res, cert);
+    if (!attempt) return;
+
+    const updated = await CertificationAttempt.findOneAndUpdate(
+      { _id: attempt._id, status: "in_progress" },
+      { $inc: { focusStrikes: 1 } },
+      { returnDocument: 'after' }
+    );
+    if (!updated) return res.status(410).json({ message: "El examen ya no está en curso" });
+
+    await logEvent(updated._id, "focus_strike", { kind, strikes: updated.focusStrikes });
+
+    if (updated.focusStrikes >= MAX_FOCUS_STRIKES) {
+      await closeAsViolation(updated, "focus_limit_reached");
+      return res.json({
+        strikes: updated.focusStrikes, limit: MAX_FOCUS_STRIKES,
+        terminated: true, reason: "focus_limit_reached",
+      });
+    }
+
+    res.json({ strikes: updated.focusStrikes, limit: MAX_FOCUS_STRIKES, terminated: false });
+  } catch (err) {
+    console.error(esProduccion ? "Error POST /strike" : `Error POST /strike: ${err}`);
+    res.status(500).json({ message: "Error al registrar la salida" });
+  }
+});
+
+// ─── POST /api/certification/:certId/leave ───────────────────────────────
+// Lo manda navigator.sendBeacon al descargarse la página, DESPUÉS de que el
+// alumno confirmó el aviso del navegador (cerrar pestaña, Alt+F4, recargar).
+// Solo deja la marca: qué pasó se decide cuando vuelve (resolveLeftTab).
+// Llega como text/plain para evitar el preflight de CORS del beacon.
+certificationRouter.post(
+  "/api/certification/:certId/leave",
+  express.text({ type: "*/*", limit: "1kb" }),
+  verifyToken,
+  async (req, res) => {
+    try {
+      let tab = "";
+      try {
+        const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
+        tab = tabFrom(body.tab);
+      } catch { /* body inválido */ }
+      if (!tab) return res.status(204).end();
+
+      const attempt = await CertificationAttempt.findOneAndUpdate(
+        { userId: req.user.uid, certId: req.params.certId, status: "in_progress" },
+        { $set: { leftAt: new Date(), leftTab: tab } },
+        { returnDocument: 'after' }
+      );
+      if (attempt) await logEvent(attempt._id, "page_unloaded", { tab });
+      res.status(204).end();
+    } catch (err) {
+      console.error(esProduccion ? "Error POST /leave" : `Error POST /leave: ${err}`);
+      res.status(204).end(); // el navegador ignora la respuesta del beacon
+    }
+  }
+);
 
 // ─── POST /api/certification/:certId/submit ──────────────────────────────
 // No recibe NADA del front: corrige con las respuestas guardadas en el servidor.
@@ -684,14 +819,26 @@ certificationRouter.post("/api/certification/:certId/submit", verifyToken, async
 
     const attempt = await findInProgress(req.user.uid, certId);
     if (!attempt) {
-      // Puede pasar si el timer y el botón dispararon a la vez, o si el /status
-      // ya lo cerró por vencimiento: devolvemos el resultado ya registrado.
-      const last = await CertificationRecord.findOne(
-        { userId: req.user.uid, certId, completedAt: { $ne: null } }, { events: 0 }
-      ).sort({ completedAt: -1 }).lean();
-      if (last && last.result !== "violation" && Date.now() - last.completedAt < 10 * 60 * 1000) {
+      // El intento ya se cerró antes de este request: el timer y el botón
+      // dispararon a la vez, o una respuesta/avance llegó vencida y el servidor
+      // ya lo corrigió (closeIfExpired). Se devuelve el resultado del ÚLTIMO
+      // intento de esta certificación.
+      // (Antes se buscaba por completedAt de los últimos 10 min, pero al vencer
+      // completedAt se registra en la hora de vencimiento, así que el resultado
+      // ya calificado podía quedar afuera y el alumno veía un error.)
+      const lastAttempt = await CertificationAttempt.findOne(
+        { userId: req.user.uid, certId }, { _id: 1, terminationReason: 1 }
+      ).sort({ startedAt: -1 }).lean();
+      const last = lastAttempt && await CertificationRecord.findOne(
+        { attemptId: lastAttempt._id, completedAt: { $ne: null } }, { events: 0 }
+      ).lean();
+
+      if (last && ["passed", "failed", "expired"].includes(last.result)) {
         const after = await getSummary(req.user.uid, certId, cert);
         return res.json(resultPayload(cert, last, { after }));
+      }
+      if (last && last.result === "violation") {
+        return res.status(409).json({ code: "ATTEMPT_CLOSED", reason: last.terminationReason });
       }
       return res.status(404).json({ message: "No hay un examen en curso" });
     }

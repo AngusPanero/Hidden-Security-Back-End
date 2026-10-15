@@ -64,6 +64,9 @@ const certificationAttemptSchema = new mongoose.Schema(
     // Motivo de cierre: "submitted", "time_expired", "legacy_engine" o una
     // violación de integridad (ej: "second_monitor_connected").
     terminationReason: { type: String, default: null },
+    focusStrikes: { type: Number, default: 0 },    // salidas del examen (a la 3.ª se cancela)
+    leftAt:       { type: Date,   default: null },  // aviso de cierre de pestaña recibido
+    leftTab:      { type: String, default: null },  
   },
   { timestamps: true, minimize: false }
 );

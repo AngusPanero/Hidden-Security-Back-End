@@ -358,7 +358,7 @@
         "82c0a6f9-faca-44f6-ada7-024c3804e9fc"
       ],
       "transitions": {
-        "3": "<div class='cex-transition'><div class='cex-transition-label'>🔁 Información adicional</div><p>Después de las acciones de P2:</p>\n<p>Tras el análisis inicial y el enriquecimiento con el equipo de inteligencia, se confirma que uno de los dominios observados (<code class='cex-inline-code'>files-backup-center.net</code>) está asociado a una campaña activa de exfiltración reportada recientemente.<br>No se cuenta aún con validación del usuario.</p></div>"
+        "3": "<div class='cex-transition'><div class='cex-transition-label'>Información adicional</div><p>Después de las acciones de P2:</p>\n<p>Tras el análisis inicial y el enriquecimiento con el equipo de inteligencia, se confirma que uno de los dominios observados (<code class='cex-inline-code'>files-backup-center.net</code>) está asociado a una campaña activa de exfiltración reportada recientemente.<br>No se cuenta aún con validación del usuario.</p></div>"
       }
     },
     "SOCL1-CASO-E2": {
@@ -388,7 +388,7 @@
         "874195de-c2ac-4248-8b25-77d9ec44787b"
       ],
       "transitions": {
-        "3": "<div class='cex-transition'><div class='cex-transition-label'>🔁 Información adicional</div><p>Durante el análisis, se decodifica el contenido del <code class='cex-inline-code'>EncodedCommand</code>, observándose que el script ejecutado realiza una conexión a un dominio externo (<code class='cex-inline-code'>cdn-update-service.net</code>) y descarga contenido adicional.<br>El dominio presenta coincidencias con indicadores reportados recientemente en campañas activas.</p></div>"
+        "3": "<div class='cex-transition'><div class='cex-transition-label'>Información adicional</div><p>Durante el análisis, se decodifica el contenido del <code class='cex-inline-code'>EncodedCommand</code>, observándose que el script ejecutado realiza una conexión a un dominio externo (<code class='cex-inline-code'>cdn-update-service.net</code>) y descarga contenido adicional.<br>El dominio presenta coincidencias con indicadores reportados recientemente en campañas activas.</p></div>"
       }
     },
     "SOCL1-CASO-E4": {
@@ -418,7 +418,7 @@
         "6cb3f7b1-b172-425f-9bd0-3c9eb9b193d4"
       ],
       "transitions": {
-        "5": "<div class='cex-transition'><div class='cex-transition-label'>🔁 Información adicional</div><p>Durante las validaciones, se confirma que la actividad corresponde a una herramienta interna de simulación de ataques utilizada para pruebas de seguridad en el entorno.</p></div>"
+        "5": "<div class='cex-transition'><div class='cex-transition-label'>Información adicional</div><p>Durante las validaciones, se confirma que la actividad corresponde a una herramienta interna de simulación de ataques utilizada para pruebas de seguridad en el entorno.</p></div>"
       }
     },
     "SOCL1-CASO-E6": {
