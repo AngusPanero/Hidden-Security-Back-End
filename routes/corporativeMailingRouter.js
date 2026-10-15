@@ -124,6 +124,16 @@ const REQUEST_TYPE_LABELS = {
     trainee: "TRAINEE / SPONSOR",
 };
 
+// Etiqueta "humana" para el mail de confirmación al solicitante
+const REQUEST_TYPE_CONFIRM_LABELS = {
+    empresa: "Empresa",
+    trainee: "Partner Trainee",
+};
+
+// URL del front para el botón "Crear mi cuenta"
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://hidden-security.org";
+const CONTACT_EMAIL = "contacto@hidden-security.org";
+
 // -- POST /request ------------------------------------------------
 /// Escapa los datos del formulario antes de meterlos en el HTML del mail,
 // para que nadie pueda inyectar etiquetas o links desde los campos.
@@ -142,6 +152,75 @@ const isValidPhone = (phone) => {
     const digits = value.replace(/\D/g, "");
     return PHONE_ALLOWED.test(value) && digits.length >= 7 && digits.length <= 15;
 };
+
+// -- Mail de confirmación al solicitante -----------------------------
+const buildConfirmationHtml = ({ fullName, typeLabel }) => `
+    ${emailHead("Recibimos tu solicitud de acceso | Hidden Security")}
+    ${emailCabecera("SOLICITUD<br/>RECIBIDA")}
+
+    <tr><td style="background-color:#000000; padding:44px 40px 40px;">
+
+        <table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+            <tr><td>
+            <span style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:3px; text-transform:uppercase; color:#ccff00; border:1px solid rgba(204,255,0,0.35); padding:5px 14px; background:rgba(204,255,0,0.06); display:inline-block;">⚡ ${typeLabel.toUpperCase()}</span>
+            </td></tr>
+        </table>
+
+        <p style="font-family:'Montserrat',Arial,sans-serif; font-size:32px; font-weight:900; letter-spacing:-2px; text-transform:uppercase; color:#ffffff; line-height:1.05; margin:0 0 18px;">
+            SOLICITUD<br/><span style="color:#ccff00; font-weight:400;">RECIBIDA.</span>
+        </p>
+
+        ${divisor}
+
+        <p style="font-family:'Montserrat',Arial,sans-serif; font-size:15px; font-weight:700; color:#ffffff; line-height:1.6; margin:0 0 18px;">
+            Hola ${fullName},
+        </p>
+
+        <p style="font-family:'Montserrat',Arial,sans-serif; font-size:14px; color:rgba(255,255,255,0.75); line-height:1.7; margin:0 0 16px;">
+            Recibimos correctamente tu solicitud de acceso a Hidden Security como <strong style="color:#ccff00;">${typeLabel}</strong>.
+        </p>
+
+        <p style="font-family:'Montserrat',Arial,sans-serif; font-size:14px; color:rgba(255,255,255,0.75); line-height:1.7; margin:0 0 16px;">
+            Mientras nuestro equipo revisa la información, podés avanzar creando tu cuenta en la plataforma con el mismo correo electrónico que utilizaste en la solicitud.
+        </p>
+
+        <p style="font-family:'Montserrat',Arial,sans-serif; font-size:14px; color:rgba(255,255,255,0.75); line-height:1.7; margin:0 0 32px;">
+            Una vez revisada y aprobada, vamos a actualizar tu cuenta para habilitar el acceso correspondiente a <strong style="color:#ccff00;">${typeLabel}</strong>. No vas a necesitar registrarte nuevamente.
+        </p>
+
+        <table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:32px;">
+            <tr><td style="background-color:#ccff00;">
+                <a href="${FRONTEND_URL}" target="_blank"
+                    style="display:inline-block; font-family:'Montserrat',Arial,sans-serif; font-size:12px; font-weight:900; letter-spacing:3px; text-transform:uppercase; color:#000000; text-decoration:none; padding:16px 32px;">
+                    CREAR MI CUENTA →
+                </a>
+            </td></tr>
+        </table>
+
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:32px;">
+            <tr><td style="background:rgba(204,255,0,0.04); border-left:3px solid #ccff00; padding:16px 20px;">
+                <p style="font-family:'Montserrat',Arial,sans-serif; font-size:12px; color:rgba(255,255,255,0.6); line-height:1.7; margin:0;">
+                    Si ya tenés una cuenta en Hidden Security con este correo, no necesitás hacer nada. Nuestro equipo se pondrá en contacto con vos para continuar con el proceso.
+                </p>
+            </td></tr>
+        </table>
+
+        ${divisor}
+
+        <p style="font-family:'Montserrat',Arial,sans-serif; font-size:14px; color:rgba(255,255,255,0.75); line-height:1.7; margin:0 0 20px;">
+            Gracias por tu interés en formar parte de Hidden Security.
+        </p>
+
+        <p style="font-family:'Montserrat',Arial,sans-serif; font-size:14px; font-weight:700; color:#ffffff; margin:0 0 4px;">
+            Equipo Hidden Security
+        </p>
+        <p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; margin:0;">
+            <a href="mailto:${CONTACT_EMAIL}" style="color:#ccff00; text-decoration:none;">${CONTACT_EMAIL}</a>
+        </p>
+
+    </td></tr>
+
+    ${emailFirma}`;
 
 corporativeMailingRouter.post("/corporate-mailing/request", async (req, res) => {
     console.log("[POST /request] body recibido:", req.body);
@@ -190,7 +269,7 @@ corporativeMailingRouter.post("/corporate-mailing/request", async (req, res) => 
 
                 <table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
                     <tr><td>
-                    <span style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:3px; text-transform:uppercase; color:#ccff00; border:1px solid rgba(204,255,0,0.35); padding:5px 14px; background:rgba(204,255,0,0.06); display:inline-block;">⚡ ${requestTypeLabel}</span>
+                    <span style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:3px; text-transform:uppercase; color:#ccff00; border:1px solid rgba(204,255,0,0.35); padding:5px 14px; background:rgba(204,255,0,0.06); display:inline-block;">${requestTypeLabel}</span>
                     </td></tr>
                 </table>
 
@@ -268,6 +347,23 @@ corporativeMailingRouter.post("/corporate-mailing/request", async (req, res) => 
         console.error(esProduccion ? "Error sending corporative request mail 🔴" : `Error sending corporative request mail 🔴 ${mailError}`);
         console.error("[POST /request] mailError completo:", mailError);
         return res.status(500).json({ message: "Error al enviar la solicitud 🔴", error: mailError.message });
+    }
+
+    // -- Mail de confirmación al solicitante ---------------------------
+    // La solicitud ya llegó al equipo: si esta confirmación falla, solo se
+    // loguea y la respuesta al front sigue siendo exitosa.
+    try {
+        await sendMail({
+            to:      String(email).trim(),
+            subject: "Recibimos tu solicitud de acceso | Hidden Security",
+            html:    buildConfirmationHtml({
+                fullName:  safe.fullName,
+                typeLabel: REQUEST_TYPE_CONFIRM_LABELS[requestType],
+            }),
+        });
+        console.log("[POST /request] mail de confirmación enviado a:", email);
+    } catch (confirmError) {
+        console.error(esProduccion ? "Error sending confirmation mail to requester 🔴" : `Error sending confirmation mail to requester 🔴 ${confirmError}`);
     }
 
     return res.status(201).json({ message: "Request submitted successfully! 🟢" });

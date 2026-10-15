@@ -53,6 +53,9 @@ const BUNDLED_VOUCHERS = {
 // Recargo por cuotas — debe reflejar exactamente lo que muestra el checkout
 const INTERES_RATES = { "1": 0, "3": 0.15, "6": 0.30, "12": 0.65 };
 
+const MP_FEE_RATES    = { "1": 0.05, "3": 0.15, "6": 0.30, "12": 0.65 };
+const MP_FEE_STANDARD = MP_FEE_RATES["1"];
+
 // Cuotas sin interés por plan. Si un plan no está listado se asume 1,
 // para no otorgar un beneficio por accidente en planes/promos nuevas.
 const PLAN_CUOTAS_SIN_INTERES = {
@@ -90,6 +93,27 @@ const FULFILLMENT_STALE_MS = 2 * 60 * 1000;
 // ═══════════════════════════════════════════════════════════════════════════════
 //  HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Helper: financiación y comisión de Mercado Pago ──────────────────────────
+function calcFinancing({ cuotas, amount, cuotasSinInteres }) {
+    const interestFree = cuotas > 1 && cuotas <= cuotasSinInteres;
+    const interestRate = (cuotas > 1 && !interestFree) ? (INTERES_RATES[String(cuotas)] || 0) : 0;
+    const mpFeeRate    = interestFree ? (MP_FEE_RATES[String(cuotas)] ?? MP_FEE_STANDARD) : MP_FEE_STANDARD;
+    const mpFeeAmount  = Math.round(amount * mpFeeRate);
+    return { interestFree, interestRate, mpFeeRate, mpFeeAmount, netAmount: amount - mpFeeAmount };
+}
+
+// ─── Helper: completar financiación en pagos viejos (sin los campos) ──────────
+function withFinancing(p) {
+    if (p.mpFeeRate !== undefined && p.mpFeeRate !== null) return p;
+    const cuotas = Number(p.cuotas) || 1;
+    return {
+        ...p,
+        ...calcFinancing({ cuotas, amount: Number(p.amount) || 0, cuotasSinInteres: 1 }),
+        listAmount:   p.listAmount ?? null,
+        feeEstimated: true,
+    };
+}
 
 // ─── Helper: calcular fecha de expiración ──────────────────────────────────────
 function calcExpiresAt(planId) {
@@ -425,7 +449,7 @@ paymentsRouter.get("/all-tickets", adminMiddleware, async (req, res) => {
             .lean();
 
         // Lista vacía = 200 con [], no 404 (no es un error)
-        return res.status(200).json(allPayments);
+        return res.status(200).json(allPayments.map(withFinancing));
     } catch (error) {
         console.error("Error fetching all tickets!", error);
         return res.status(500).json({ message: "Internal Server Error 🔴" });
@@ -496,6 +520,7 @@ paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
         }
 
         const finalAmount = Math.round(totalConInteres - discountAmount);
+        const financing = calcFinancing({ cuotas, amount: finalAmount, cuotasSinInteres });
 
         console.log(`💰 base: $${baseAmount} | cuotas: ${cuotas} (recargo ${(tasaInteres * 100).toFixed(0)}%) | descuento: ${appliedDiscount}% | final: $${finalAmount}`);
 
@@ -518,6 +543,8 @@ paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
             items,
             amount:         finalAmount,
             cuotas,
+            listAmount:     baseAmount,
+            ...financing,
             couponUsed:     couponCodeUsed,
             discount:       appliedDiscount,
             date:           new Date(),
@@ -774,6 +801,7 @@ paymentsRouter.post("/course-payment", verifyToken, async (req, res) => {
         }
 
         const finalAmount = Math.round(totalConInteres - discountAmount);
+        const financing = calcFinancing({ cuotas, amount: finalAmount, cuotasSinInteres });
 
         console.log(`💰 base: $${baseAmount} | cuotas: ${cuotas} (recargo ${(tasaInteres * 100).toFixed(0)}%) | descuento: ${appliedDiscount}% | final: $${finalAmount}`);
 
@@ -794,6 +822,12 @@ paymentsRouter.post("/course-payment", verifyToken, async (req, res) => {
             items,
             amount:         finalAmount,
             cuotas,
+            listAmount:   { type: Number },
+            interestFree: { type: Boolean },
+            interestRate: { type: Number },
+            mpFeeRate:    { type: Number },
+            mpFeeAmount:  { type: Number },
+            netAmount:    { type: Number },
             couponUsed:     couponCodeUsed,
             discount:       appliedDiscount,
             date:           new Date(),
