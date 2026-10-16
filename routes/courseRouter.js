@@ -3,7 +3,7 @@ const courseRouter   = express.Router();
 const CourseProgress = require("../models/CourseSchema");
 const verifyToken    = require("../middleware/authMiddleware");
 const auth           = require("../config/firebase");
-const { COURSES, VALID_COURSE_IDS } = require("../config/courses");
+const { COURSES, VALID_COURSE_IDS, getQuizModuleNumber } = require("../config/courses");
 
 const esProduccion = process.env.NODE_ENV === "production";
 
@@ -52,40 +52,35 @@ function getCourse(courseId, res) {
 }
 
 // --- Helper: buscar o crear el progreso de forma ATÓMICA --------------------
-// Antes esto era `findOne` y, si no existía, `create` en un segundo paso.
-// Eso deja una ventana de carrera: en dev, React StrictMode dispara el
-// useEffect que llama a fetchProgress() DOS VECES casi en simultáneo. Si el
-// usuario todavía no tiene documento de progreso, ambos requests hacen
-// findOne → null → intentan crear, y el segundo choca contra el índice
-// único { userId, courseId } (E11000 duplicate key), lo que se traducía en
-// un 500 en el catch. findOneAndUpdate con upsert:true es atómico a nivel
-// de Mongo — sea cual sea el orden de llegada, nunca puede haber dos
-// creaciones en paralelo para el mismo userId+courseId.
+// findOneAndUpdate con upsert:true es atómico a nivel de Mongo — evita el
+// E11000 que generaba el doble fetch de React StrictMode en dev.
 async function findOrCreateProgress(userId, courseId) {
   return CourseProgress.findOneAndUpdate(
     { userId, courseId },
     { $setOnInsert: { userId, courseId } },
-    { new: true, upsert: true, setDefaultsOnInsert: true }
+    { returnDocument: "after", upsert: true, setDefaultsOnInsert: true }
   );
 }
 
+// --- Helper: ¿el alumno ya llegó a este step? -------------------------------
+// Mismo criterio que usa el front para bloquear el aside: un step está
+// disponible si ya lo completó o si no está por delante del currentStep.
+// Evita que alguien pida (o intente responder) el quiz del módulo 8 sin
+// haber pasado por los anteriores.
+function isStepUnlocked(progress, stepIndex) {
+  return stepIndex <= progress.currentStep || progress.completedSteps.includes(stepIndex);
+}
+
 // --- Helper: otorgar la claim de "usuario certificado" al completar un curso --
-// Es un booleano — a diferencia del árbol de skills, esto SÍ entra sin
-// problema dentro del límite de 1000 bytes de Firebase custom claims, así
-// que no hace falta derivarlo desde Mongo en cada request. Se escribe una
-// sola vez, en el momento exacto de la transición a completado.
-// Otras partes de la plataforma (certifiedMiddleware) dependen de esta
-// claim para gatear funcionalidad del lado del alumno (aplicar a vacantes,
-// ver notificaciones, etc.) — no confundir con el campo "userCertificated"
-// que arma usersDatabaseRouter.js en su respuesta JSON, que es un valor
-// calculado a partir de skillsCertifiedByHidden y significa algo distinto
-// ("tiene al menos una skill certificada por examen").
+// Booleano — entra sin problema en el límite de 1000 bytes de Firebase.
+// Se escribe una sola vez, en la transición a completado.
+// No confundir con "userCertificated" que arma usersDatabaseRouter.js
+// (valor calculado desde skillsCertifiedByHidden).
 async function grantCertifiedClaim(uid) {
   try {
     const userRecord    = await auth.getUser(uid);
     const currentClaims = userRecord.customClaims || {};
 
-    // Ya la tenía — no hacemos un write innecesario a Firebase
     if (currentClaims.userCertificated === true) return;
 
     await auth.setCustomUserClaims(uid, {
@@ -95,8 +90,7 @@ async function grantCertifiedClaim(uid) {
 
     console.log(`✅ Claim "userCertificated" activada para ${uid}`);
   } catch (err) {
-    // No relanzamos: si falla la claim, el progreso del curso ya se guardó
-    // correctamente en Mongo. Queda logueado para revisar manualmente.
+    // No relanzamos: el progreso ya se guardó en Mongo. Queda logueado.
     console.error(`Error otorgando claim userCertificated para ${uid}:`, err.message);
   }
 }
@@ -119,6 +113,48 @@ courseRouter.get("/api/course/:courseId/progress", verifyToken, requireActivePla
   }
 });
 
+// --- GET /api/course/:courseId/quiz/:stepIndex ------------------------------
+// Devuelve las preguntas del quiz del módulo SIN la respuesta correcta.
+// El front las mezcla (preguntas y opciones) en cada intento.
+courseRouter.get("/api/course/:courseId/quiz/:stepIndex", verifyToken, requireActivePlan, async (req, res) => {
+  try {
+    const { courseId } = req.params;
+    const userId       = req.user.uid;
+    const stepIndex    = Number(req.params.stepIndex);
+
+    const course = getCourse(courseId, res);
+    if (!course) return;
+
+    const moduleNumber = Number.isInteger(stepIndex) ? getQuizModuleNumber(course, stepIndex) : null;
+    if (!moduleNumber) {
+      return res.status(400).json({ message: "stepIndex no corresponde a un quiz válido" });
+    }
+
+    const progress = await findOrCreateProgress(userId, courseId);
+    if (!isStepUnlocked(progress, stepIndex)) {
+      return res.status(403).json({ message: "Completá las etapas anteriores para acceder a este quiz" });
+    }
+
+    const questions = course.quizBank.getQuizForClient(moduleNumber);
+    if (!questions) {
+      return res.status(500).json({ message: "Quiz no disponible" });
+    }
+
+    res.set("Cache-Control", "no-store");
+    res.json({
+      data: {
+        stepIndex,
+        moduleNumber,
+        passingScore: course.passingScore,
+        questions,
+      },
+    });
+  } catch (err) {
+    console.error(esProduccion ? "Error GET quiz" : `Error GET quiz: ${err}`);
+    res.status(500).json({ message: "Error al obtener el quiz" });
+  }
+});
+
 // --- PATCH /api/course/:courseId/progress/step -------------------------------
 courseRouter.patch("/api/course/:courseId/progress/step", verifyToken, requireActivePlan, async (req, res) => {
   try {
@@ -130,12 +166,11 @@ courseRouter.patch("/api/course/:courseId/progress/step", verifyToken, requireAc
     if (!course) return;
 
     // stepIndex validado contra totalSteps del backend — no del cliente
-    if (typeof stepIndex !== "number" || stepIndex < 0 || stepIndex >= course.totalSteps) {
+    if (!Number.isInteger(stepIndex) || stepIndex < 0 || stepIndex >= course.totalSteps) {
       return res.status(400).json({ message: "stepIndex inválido" });
     }
 
-    // Los steps de quiz no pueden avanzarse con esta ruta
-    // Solo avanzan si el quiz está aprobado — eso se maneja en /quiz
+    // Los quizzes solo avanzan al aprobarlos — eso se maneja en /quiz
     if (course.quizSteps.includes(stepIndex)) {
       return res.status(400).json({
         message: "Los quizzes solo avanzan al aprobarlos. Usá la ruta /quiz.",
@@ -150,8 +185,6 @@ courseRouter.patch("/api/course/:courseId/progress/step", verifyToken, requireAc
 
     progress.currentStep = Math.max(progress.currentStep, stepIndex + 1);
 
-    // Completado cuando todos los steps no-quiz están completados
-    // Y todos los quizzes están aprobados
     const wasCompleted = progress.isCompleted;
 
     const allQuizzesPassed = course.quizSteps.every(qi => {
@@ -159,8 +192,7 @@ courseRouter.patch("/api/course/:courseId/progress/step", verifyToken, requireAc
       return result?.passed === true;
     });
 
-    const totalCompleted = progress.completedSteps.length;
-    const allStepsDone   = totalCompleted >= course.totalSteps;
+    const allStepsDone = progress.completedSteps.length >= course.totalSteps;
 
     if (allStepsDone && allQuizzesPassed && !wasCompleted) {
       progress.isCompleted = true;
@@ -169,11 +201,8 @@ courseRouter.patch("/api/course/:courseId/progress/step", verifyToken, requireAc
 
     await progress.save();
 
-    // Transición a completado detectada acá también (por si el step que
-    // faltaba era un step normal, no un quiz) — otorgar claim de certificado.
-    // Las skills que otorga el curso (modernSocSkills) NO se escriben acá —
-    // se derivan en tiempo real desde usersDatabaseRouter leyendo isCompleted
-    // directo de Mongo, evitando el límite de 1000 bytes de Firebase.
+    // Las skills del curso NO se escriben acá — usersDatabaseRouter las
+    // deriva leyendo isCompleted desde Mongo (límite de 1000 bytes de Firebase).
     if (!wasCompleted && progress.isCompleted) {
       await grantCertifiedClaim(userId);
     }
@@ -186,6 +215,11 @@ courseRouter.patch("/api/course/:courseId/progress/step", verifyToken, requireAc
 });
 
 // --- PATCH /api/course/:courseId/progress/quiz -------------------------------
+// Body: { stepIndex, answers: [{ questionId, answer }] }
+//   - answers puede venir en cualquier orden (el front mezcla las preguntas)
+//   - answer es el TEXTO de la opción elegida, no un índice
+// La corrección vive en el banco (gradeQuiz): compara el texto contra la
+// opción correcta, que nunca sale del backend.
 courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, requireActivePlan, async (req, res) => {
   try {
     const { courseId }           = req.params;
@@ -195,50 +229,28 @@ courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, requireAc
     const course = getCourse(courseId, res);
     if (!course) return;
 
-    // stepIndex debe ser un quiz válido según el backend
-    if (typeof stepIndex !== "number" || !course.quizSteps.includes(stepIndex)) {
+    const moduleNumber = Number.isInteger(stepIndex) ? getQuizModuleNumber(course, stepIndex) : null;
+    if (!moduleNumber) {
       return res.status(400).json({ message: "stepIndex no corresponde a un quiz válido" });
     }
 
-    // answers debe ser un array del tamaño correcto
-    if (!Array.isArray(answers) || answers.length !== course.questionsPerQuiz) {
-      return res.status(400).json({
-        message: `Se esperan exactamente ${course.questionsPerQuiz} respuestas`,
-      });
+    const grading = course.quizBank.gradeQuiz(moduleNumber, answers);
+    if (!grading.ok) {
+      return res.status(400).json({ message: grading.error });
     }
 
-    // Validar que todas las respuestas sean números enteros >= 0
-    const allValid = answers.every(a => Number.isInteger(a) && a >= 0);
-    if (!allValid) {
-      return res.status(400).json({ message: "Todas las respuestas deben ser índices numéricos válidos" });
-    }
-
-    // -- Respuestas correctas — fuente de verdad en el backend -----------------
-    const CORRECT_ANSWERS = {
-      7:  [1,2,2,1,1,2,1,1], // Quiz Módulo 1
-      16: [2,1,2,2,1,1,1,2], // Quiz Módulo 2
-      26: [1,1,1,1,1,1,1,1], // Quiz Módulo 3
-      34: [1,2,2,1,1,2,1,1], // Quiz Módulo 4
-      42: [1,2,2,1,1,2,1,1], // Quiz Módulo 5
-      50: [1,2,2,1,1,2,1,1], // Quiz Módulo 6
-      58: [1,2,2,1,1,2,1,1], // Quiz Módulo 7
-      66: [1,2,2,1,1,2,1,1], // Quiz Módulo 8
-    };
-
-    const correctAnswers = CORRECT_ANSWERS[stepIndex];
-    let correct = 0;
-    answers.forEach((ans, i) => {
-      if (ans === correctAnswers[i]) correct++;
-    });
-
-    const score  = correct / course.questionsPerQuiz;
+    const { correct, total } = grading;
+    const score  = correct / total;
     const passed = score >= course.passingScore;
 
     const progress = await findOrCreateProgress(userId, courseId);
 
-    // Capturamos el estado ANTES de tocar nada — es lo que nos permite
-    // detectar la transición "recién ahora se completó el curso" más abajo,
-    // sin volver a otorgar la claim en cada intento posterior de quiz.
+    if (!isStepUnlocked(progress, stepIndex)) {
+      return res.status(403).json({ message: "Completá las etapas anteriores para rendir este quiz" });
+    }
+
+    // Estado ANTES de tocar nada — para detectar la transición a completado
+    // sin volver a otorgar la claim en reintentos posteriores.
     const wasCompleted = progress.isCompleted;
 
     const prevAttempts = progress.quizResults?.[String(stepIndex)]?.attempts ?? 0;
@@ -253,7 +265,6 @@ courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, requireAc
       },
     };
 
-    // Avanzar solo si aprobó
     if (passed) {
       if (!progress.completedSteps.includes(stepIndex)) {
         progress.completedSteps.push(stepIndex);
@@ -261,7 +272,6 @@ courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, requireAc
       progress.currentStep = Math.max(progress.currentStep, stepIndex + 1);
     }
 
-    // Verificar completado del curso
     const allQuizzesPassed = course.quizSteps.every(qi => {
       const result = progress.quizResults?.[String(qi)];
       return result?.passed === true;
@@ -275,20 +285,16 @@ courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, requireAc
 
     await progress.save();
 
-    // -- Recién completó el curso en este request → otorgar claim -------------
-    // Comparamos contra wasCompleted (capturado antes de guardar), así un
-    // reintento de un quiz ya aprobado, o de cualquier otro después de
-    // completado, nunca vuelve a disparar esto.
     if (!wasCompleted && progress.isCompleted) {
       await grantCertifiedClaim(userId);
     }
 
     res.json({
-      data:        progress,
+      data:         progress,
       passed,
       score,
       correct,
-      total:       course.questionsPerQuiz,
+      total,
       passingScore: course.passingScore,
     });
   } catch (err) {
@@ -298,7 +304,7 @@ courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, requireAc
 });
 
 // --- GET /api/course/progress-summary ----------------------------------------
-// Devuelve, para el usuario autenticado, el resumen de progreso de TODOS los cursos.
+// Resumen de progreso de TODOS los cursos del usuario autenticado.
 courseRouter.get("/api/course/progress-summary", verifyToken, async (req, res) => {
   try {
     const userId = req.user.uid;
