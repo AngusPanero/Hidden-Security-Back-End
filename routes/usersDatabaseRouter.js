@@ -1,10 +1,9 @@
 const express = require("express");
 const usersDatabaseRouter = express.Router();
 const { CV } = require("../models/cvModel");
-const CourseProgress = require("../models/CourseSchema");
 const auth = require("../config/firebase"); // mismo export que usa tu script certifySkills.js
 const enterpriseMiddleware = require("../middleware/enterpriseMiddleware");
-const { COURSES, flattenSkillTree } = require("../config/courses");
+const { readCompletedCourses, getCourseSkillsFromClaims } = require("../config/courses");
 
 const esProduccion = process.env.NODE_ENV === "production";
 
@@ -30,8 +29,12 @@ function flattenSkills(skills) {
   ];
 }
 
-// ─── Helper: trae skillsCertifiedByHidden de Firebase para varios uids ────────
-async function getCertifiedSkillsMap(userIds) {
+// ─── Helper: lee de Firebase las validaciones de Hidden para varios uids ──────
+// Todo sale de las custom claims, en lotes de 100 (límite de getUsers):
+// - skillsCertifiedByHidden: examen controlado
+// - completedCourses:        ids de cursos completados (ej. ["modernSoc"])
+// - courseSkills:            árbol de skills de esos cursos (config/courses.js)
+async function getClaimsValidationsMap(userIds) {
   const map = {};
   const uniqueIds = [...new Set(userIds)].filter(Boolean);
   const BATCH_SIZE = 100;
@@ -50,38 +53,15 @@ async function getCertifiedSkillsMap(userIds) {
 
     for (const userRecord of result.users) {
       const claims = userRecord.customClaims || {};
-      map[userRecord.uid] = Array.isArray(claims.skillsCertifiedByHidden)
-        ? claims.skillsCertifiedByHidden
-        : [];
+      map[userRecord.uid] = {
+        certifiedSkills:  Array.isArray(claims.skillsCertifiedByHidden) ? claims.skillsCertifiedByHidden : [],
+        completedCourses: readCompletedCourses(claims),
+        courseSkills:     getCourseSkillsFromClaims(claims),
+      };
     }
   }
 
   return map;
-}
-
-// ─── Helper: deriva las skills otorgadas por cursos completados ───────────────
-async function getCourseSkillsMap(userIds) {
-  const map = {};
-  const uniqueIds = [...new Set(userIds)].filter(Boolean);
-  if (uniqueIds.length === 0) return map;
-
-  const completedProgress = await CourseProgress.find(
-    { userId: { $in: uniqueIds }, isCompleted: true },
-    { userId: 1, courseId: 1 }
-  ).lean();
-
-  for (const uid of uniqueIds) map[uid] = new Set();
-
-  for (const p of completedProgress) {
-    const course = COURSES[p.courseId];
-    if (!course) continue;
-    const skills = flattenSkillTree(course.skillTree);
-    for (const skill of skills) map[p.userId].add(skill);
-  }
-
-  const result = {};
-  for (const uid of uniqueIds) result[uid] = [...map[uid]];
-  return result;
 }
 
 // ─── GET /api/users-database ───────────────────────────────────────────────────
@@ -101,9 +81,9 @@ usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req,
 
     // Si hay término de búsqueda, además de filtrar en Mongo por nombre/email/
     // headline/skills declaradas, necesitamos saber si matchea alguna skill
-    // otorgada por curso — pero esas NO viven en el documento de Mongo, se
-    // calculan en memoria más abajo. Por eso guardamos el regex acá y hacemos
-    // el filtro combinado (Mongo OR curso) después de tener courseSkillsMap.
+    // otorgada por curso — pero esas NO viven en el documento del CV, salen de
+    // las claims. Por eso guardamos el regex acá y hacemos el filtro combinado
+    // (Mongo OR curso) después de leer las claims.
     let searchRegex = null;
 
     if (search) {
@@ -139,21 +119,22 @@ usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req,
     // entrada a quien solo matchea por una skill de curso (esas no están en
     // el documento). Por eso, SI hay search, traemos el universo completo
     // (sin el filtro $or de search) y filtramos en memoria más abajo, una vez
-    // que ya tengamos courseSkillsMap calculado.
+    // que ya tengamos las claims leídas.
     const mongoFilterForQuery = { ...mongoFilter };
     if (search) delete mongoFilterForQuery.$or;
 
     const allMatches = await CV.find(mongoFilterForQuery).lean();
 
     const userIds = allMatches.map(cv => cv.userId);
-    const [certifiedMap, courseSkillsMap] = await Promise.all([
-      getCertifiedSkillsMap(userIds),
-      getCourseSkillsMap(userIds),
-    ]);
+    const validationsMap = await getClaimsValidationsMap(userIds);
 
     let enriched = allMatches.map(cv => {
-      const skillsCertifiedByHidden = certifiedMap[cv.userId] || [];
-      const modernSocSkills         = courseSkillsMap[cv.userId] || [];
+      const v = validationsMap[cv.userId];
+      const skillsCertifiedByHidden = v?.certifiedSkills  || [];
+      // Se mantiene el nombre modernSocSkills porque el front ya lo usa —
+      // ahora son las skills de TODOS los cursos completados según la claim.
+      const modernSocSkills         = v?.courseSkills     || [];
+      const completedCourses        = v?.completedCourses || [];
       return {
         id:                      cv.userId,
         personalInfo:            cv.personalInfo,
@@ -168,11 +149,12 @@ usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req,
         updatedAt:               cv.updatedAt,
         skillsCertifiedByHidden,
         modernSocSkills,
+        completedCourses,
         userCertificated:        skillsCertifiedByHidden.length > 0,
       };
     });
 
-    // ── Filtros que solo se pueden aplicar después de leer Firebase/Mongo ──
+    // ── Filtros que solo se pueden aplicar después de leer Firebase ────────
     if (certifiedOnly) {
       enriched = enriched.filter(c => c.userCertificated);
     }
@@ -241,11 +223,11 @@ usersDatabaseRouter.get("/api/users-database/skills-summary", enterpriseMiddlewa
     }
 
     const userIds = allCVs.map(cv => cv.userId);
-    const certifiedMap = await getCertifiedSkillsMap(userIds);
+    const validationsMap = await getClaimsValidationsMap(userIds);
 
     const certifiedSet = new Set();
-    for (const uid of Object.keys(certifiedMap)) {
-      for (const skill of certifiedMap[uid]) certifiedSet.add(skill);
+    for (const uid of Object.keys(validationsMap)) {
+      for (const skill of validationsMap[uid].certifiedSkills) certifiedSet.add(skill);
     }
 
     res.json({

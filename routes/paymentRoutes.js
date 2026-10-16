@@ -1050,6 +1050,11 @@ paymentsRouter.get("/api/refresh-claims", verifyToken, async (req, res) => {
         const purchaseExpiry = currentClaims.purchaseExpiry || {};
         const isEnterprise   = !!currentClaims.isEnterprise;
 
+        // Cursos completados (claim completedCourses, ej. ["modernSoc"])
+        const completedCourses = Array.isArray(currentClaims.completedCourses)
+            ? currentClaims.completedCourses
+            : [];
+
         // ── 1. Detectar planes vencidos ───────────────────────────────────────
         const now          = new Date();
         const expiredPlans = [];
@@ -1086,9 +1091,13 @@ paymentsRouter.get("/api/refresh-claims", verifyToken, async (req, res) => {
         }
 
         // ── 3. ¿La cookie tiene claims viejas? → renovarla ────────────────────
+        // completedCourses: al terminar un curso la claim cambia y la cookie queda vieja.
+        // userCertificated: claim vieja que se borra al completar un curso.
         const cookieStale =
-            JSON.stringify(req.user.purchases ?? [])      !== JSON.stringify(finalPurchases) ||
-            JSON.stringify(req.user.purchaseExpiry ?? {}) !== JSON.stringify(finalExpiry);
+            JSON.stringify(req.user.purchases ?? [])        !== JSON.stringify(finalPurchases) ||
+            JSON.stringify(req.user.purchaseExpiry ?? {})   !== JSON.stringify(finalExpiry) ||
+            JSON.stringify(req.user.completedCourses ?? []) !== JSON.stringify(completedCourses) ||
+            (req.user.userCertificated ?? null)             !== (currentClaims.userCertificated ?? null);
 
         const sessionRefreshed = expiredPlans.length > 0 || cookieStale;
         if (sessionRefreshed) await safeRefreshSession(uid, res);
@@ -1100,6 +1109,7 @@ paymentsRouter.get("/api/refresh-claims", verifyToken, async (req, res) => {
             expiredPlans,
             purchases:      finalPurchases,
             purchaseExpiry: finalExpiry,
+            completedCourses,
         });
 
     } catch (error) {

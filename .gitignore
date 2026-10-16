@@ -49,7 +49,7 @@ venv/
 makeAdmin.js
 makeEnterprise.js
 clearPurchased.js
-makeCertificated.js
+makeCompletedModernSoc.js
 clearAllCustomClaims.js
 certifySkills.js
 makePartner.js

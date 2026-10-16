@@ -3,6 +3,7 @@ const refreshClaimsRouter = express.Router();
 
 const auth           = require("../config/firebase");            // Admin SDK (mismo que usa vacancyRouter)
 const authMiddleware = require("../middleware/authMiddleware");  // verifica la cookie y setea req.user
+const { readCompletedCourses } = require("../config/courses");
 
 const esProduccion = process.env.NODE_ENV === "production";
 
@@ -20,12 +21,15 @@ const SESSION_COOKIE_OPTIONS = {
 
 // Claims que el front y los middlewares usan. Se comparan también las que
 // pudieron haberse BORRADO de Firebase (por eso no alcanza con Object.keys).
+// "userCertificated" queda en la lista a propósito: es la claim vieja que se
+// borra al completar un curso, y así la cookie se renueva sin ella.
 const TRACKED_CLAIMS = [
   "admin", "partner", "isEnterprise", "userCertificated",
   "purchases", "purchaseExpiry",
   "enterprisePlan", "enterprisePlanExpiry", "vacancyLimit", "vacanciesUsed",
   "companyName", "companyLogo",
   "skillsCertifiedByHidden",
+  "completedCourses",
 ];
 
 function claimsChanged(fromCookie, fromFirebase) {
@@ -90,8 +94,10 @@ refreshClaimsRouter.get("/api/refresh-claims", authMiddleware, async (req, res) 
       ok: true,
       sessionRefreshed,
       // Compat con UserDashboard (ya lee estos dos campos)
-      purchases:      freshClaims.purchases      ?? [],
-      purchaseExpiry: freshClaims.purchaseExpiry ?? {},
+      purchases:        freshClaims.purchases      ?? [],
+      purchaseExpiry:   freshClaims.purchaseExpiry ?? {},
+      // Cursos completados, frescos desde Firebase (no de la cookie)
+      completedCourses: readCompletedCourses(freshClaims),
     });
   } catch (err) {
     console.error(esProduccion ? "Error GET /refresh-claims" : `Error GET /refresh-claims: ${err}`);

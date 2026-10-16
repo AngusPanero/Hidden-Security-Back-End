@@ -37,6 +37,11 @@ if (modernSocBank.moduleCount() !== soc1QuizSteps.length) {
 
 const COURSES = {
   soc1: {
+    title:             "Modern SOC Operations",
+    // Valor que entra en la claim completedCourses al terminar el curso.
+    // Es la fuente de verdad de "qué cursos completó" y de qué árbol de
+    // skills le corresponde (ver getCourseSkillsFromClaims).
+    completionClaimId: "modernSoc",
     totalSteps:   soc1TotalSteps, // 87
     quizSteps:    soc1QuizSteps,  // [8,19,31,45,56,66,76,86]
     passingScore: 0.70,
@@ -64,4 +69,34 @@ function flattenSkillTree(tree) {
   return [...new Set(Object.values(tree).flat())];
 }
 
-module.exports = { COURSES, VALID_COURSE_IDS, getQuizModuleNumber, flattenSkillTree };
+// completionClaimId → curso. Ej: "modernSoc" → COURSES.soc1
+const COURSES_BY_CLAIM_ID = Object.fromEntries(
+  Object.values(COURSES).map(course => [course.completionClaimId, course])
+);
+
+// Lee la claim completedCourses de forma segura (array de strings o []).
+function readCompletedCourses(claims) {
+  const list = claims?.completedCourses;
+  return Array.isArray(list) ? list.filter(id => typeof id === "string") : [];
+}
+
+// Claims del usuario → skills que le otorgan los cursos completados.
+// Ids desconocidos (curso borrado o mal escrito) se ignoran sin romper.
+function getCourseSkillsFromClaims(claims) {
+  const skills = new Set();
+  for (const claimId of readCompletedCourses(claims)) {
+    const course = COURSES_BY_CLAIM_ID[claimId];
+    if (!course) continue;
+    for (const skill of flattenSkillTree(course.skillTree)) skills.add(skill);
+  }
+  return [...skills];
+}
+
+module.exports = {
+  COURSES,
+  VALID_COURSE_IDS,
+  getQuizModuleNumber,
+  flattenSkillTree,
+  readCompletedCourses,
+  getCourseSkillsFromClaims,
+};

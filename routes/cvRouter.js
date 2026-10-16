@@ -3,9 +3,8 @@ const cvRouter = express.Router();
 const { CV } = require("../models/cvModel");
 const verifyToken = require("../middleware/authMiddleware");
 const enterpriseMiddleware = require("../middleware/enterpriseMiddleware");
-const CourseProgress = require("../models/CourseSchema");
 const auth = require("../config/firebase");
-const { COURSES, flattenSkillTree } = require("../config/courses");
+const { readCompletedCourses, getCourseSkillsFromClaims } = require("../config/courses");
 
 const esProduccion = process.env.NODE_ENV === "production";
 
@@ -80,32 +79,28 @@ function formatCVForEnterprise(cv) {
 
 // ─── Helper: validaciones de Hidden para un candidato ─────────────────────────
 // Duplicado a propósito de usersDatabaseRouter — se unifica al sumar otro curso.
-// - skillsCertifiedByHidden: examen controlado (claims de Firebase)
-// - modernSocSkills: skills de cursos completados (CourseProgress en Mongo)
+// Todo sale de las custom claims de Firebase:
+// - skillsCertifiedByHidden: examen controlado
+// - completedCourses:        ids de cursos completados (ej. ["modernSoc"])
+// - modernSocSkills:         árbol de skills de esos cursos (config/courses.js).
+//   Se mantiene el nombre porque el front ya lo usa.
 async function getCandidateValidations(userId) {
-  let skillsCertifiedByHidden = [];
+  let claims = {};
   try {
     const userRecord = await auth.getUser(userId);
-    const claims = userRecord.customClaims || {};
-    if (Array.isArray(claims.skillsCertifiedByHidden)) {
-      skillsCertifiedByHidden = claims.skillsCertifiedByHidden;
-    }
+    claims = userRecord.customClaims || {};
   } catch (err) {
     console.error(esProduccion ? "Error leyendo claims del candidato" : `Error leyendo claims de ${userId}: ${err.message}`);
   }
 
-  const completed = await CourseProgress.find(
-    { userId, isCompleted: true },
-    { courseId: 1 }
-  ).lean();
-
-  const modernSocSkills = [...new Set(
-    completed.flatMap(p => flattenSkillTree(COURSES[p.courseId]?.skillTree))
-  )];
+  const skillsCertifiedByHidden = Array.isArray(claims.skillsCertifiedByHidden)
+    ? claims.skillsCertifiedByHidden
+    : [];
 
   return {
     skillsCertifiedByHidden,
-    modernSocSkills,
+    completedCourses: readCompletedCourses(claims),
+    modernSocSkills:  getCourseSkillsFromClaims(claims),
     userCertificated: skillsCertifiedByHidden.length > 0,
   };
 }

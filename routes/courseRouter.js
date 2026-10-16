@@ -76,22 +76,21 @@ function isStepUnlocked(progress, stepIndex) {
 // Se escribe una sola vez, en la transición a completado.
 // No confundir con "userCertificated" que arma usersDatabaseRouter.js
 // (valor calculado desde skillsCertifiedByHidden).
-async function grantCertifiedClaim(uid) {
+async function grantCourseCompletedClaim(uid, course) {
   try {
     const userRecord    = await auth.getUser(uid);
     const currentClaims = userRecord.customClaims || {};
+    const completed     = Array.isArray(currentClaims.completedCourses) ? currentClaims.completedCourses : [];
 
-    if (currentClaims.userCertificated === true) return;
+    if (completed.includes(course.completionClaimId)) return;
 
+    const { userCertificated, ...rest } = currentClaims; // limpia la claim vieja
     await auth.setCustomUserClaims(uid, {
-      ...currentClaims,
-      userCertificated: true,
+      ...rest,
+      completedCourses: [...completed, course.completionClaimId],
     });
-
-    console.log(`✅ Claim "userCertificated" activada para ${uid}`);
   } catch (err) {
-    // No relanzamos: el progreso ya se guardó en Mongo. Queda logueado.
-    console.error(`Error otorgando claim userCertificated para ${uid}:`, err.message);
+    console.error(`Error otorgando completedCourses para ${uid}:`, err.message);
   }
 }
 
@@ -204,8 +203,8 @@ courseRouter.patch("/api/course/:courseId/progress/step", verifyToken, requireAc
     // Las skills del curso NO se escriben acá — usersDatabaseRouter las
     // deriva leyendo isCompleted desde Mongo (límite de 1000 bytes de Firebase).
     if (!wasCompleted && progress.isCompleted) {
-      await grantCertifiedClaim(userId);
-    }
+    await grantCourseCompletedClaim(userId, course);
+  }
 
     res.json({ data: progress });
   } catch (err) {
@@ -286,7 +285,7 @@ courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, requireAc
     await progress.save();
 
     if (!wasCompleted && progress.isCompleted) {
-      await grantCertifiedClaim(userId);
+      await grantCourseCompletedClaim(userId, course);
     }
 
     res.json({
