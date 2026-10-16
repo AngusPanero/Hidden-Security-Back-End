@@ -12,7 +12,7 @@ const modernSocBank = require("../bancoPreguntasModernSocCurso/bancoPreguntasMod
 //   M7:  9 PDFs (intro, soc1-soc7,  final) + quiz = 10
 //   M8:  9 PDFs (intro, soc1-soc7,  final) + quiz = 10
 // ⚠️ Tiene que coincidir 1:1 con MODULES_CONFIG del front (Soc1Course.tsx).
-const SOC1_MODULE_SIZES = [9, 11, 12, 14, 11, 10, 10, 10];
+const SOC1_MODULE_SIZES = [10, 11, 12, 14, 11, 10, 10, 10];
 
 // El quiz de cada módulo es siempre su último step — se calcula acumulando
 // los tamaños de SOC1_MODULE_SIZES en orden.

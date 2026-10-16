@@ -18,8 +18,8 @@
 //                en el documento ("A", "B", "C"…). Para V/F: A = Verdadero,
 //                B = Falso. Nunca sale del backend.
 //
-//  Para reemplazar los módulos 7 y 8: armá MODULO_7 / MODULO_8 con el mismo
-//  formato y cambiá las dos líneas de BANCO_PREGUNTAS al final del árbol.
+//  Cada módulo puede tener distinta cantidad de preguntas (1 a 6 tienen 8;
+//  7 y 8 tienen 10). La corrección usa la cantidad de cada módulo.
 // ══════════════════════════════════════════════════════════════════════════════
 
 const VF = ["Verdadero", "Falso"];
@@ -636,12 +636,245 @@ const MODULO_6 = [
   },
 ];
 
-// ── Placeholder: copia un módulo con ids propios del módulo destino ─────────
-// Así, cuando lleguen las preguntas reales de 7 y 8, solo cambia el array:
-// los ids ya tienen el prefijo correcto y nada más del sistema se entera.
-function placeholderFrom(sourceQuestions, targetModule) {
-  return sourceQuestions.map((q, i) => ({ ...q, id: `m${targetModule}-q${i + 1}` }));
-}
+// ── Módulo 7 ────────────────────────────────────────────────────────────────
+const MODULO_7 = [
+  {
+    id: "m7-q1",
+    type: "multiple",
+    question: "Una alerta de PowerShell aparece en EDR. ¿Qué información buscarías primero?",
+    options: [
+      "El hash del archivo ejecutado y su reputación en VirusTotal",
+      "La línea de comandos completa, proceso padre y usuario que ejecutó el script",
+      "El volumen de eventos similares en las últimas 24 horas",
+      "Si el endpoint tiene parches pendientes de seguridad",
+    ],
+    answer: "B",
+  },
+  {
+    id: "m7-q2",
+    type: "multiple",
+    question: "Desde el punto de vista operativo, ¿cuál es la diferencia principal entre SIEM y SOAR?",
+    options: [
+      "SIEM detecta en endpoint; SOAR correlaciona logs históricos",
+      "SIEM y SOAR son equivalentes, solo difieren en el fabricante",
+      "SIEM centraliza y correlaciona logs; SOAR orquesta respuestas automatizadas entre fuentes",
+      "SOAR reemplaza al SIEM en entornos cloud-native",
+    ],
+    answer: "C",
+  },
+  {
+    id: "m7-q3",
+    type: "multiple",
+    question: "¿Cuál de estas tareas debería requerir aprobación humana en un SOC?",
+    options: [
+      "Enriquecimiento automático de alertas con threat intel",
+      "Aislamiento de un servidor productivo crítico",
+      "Apertura automática de tickets de baja severidad",
+      "Bloqueo de IPs en listas negras conocidas",
+    ],
+    answer: "B",
+  },
+  {
+    id: "m7-q4",
+    type: "multiple",
+    question: "¿Qué problema principal intenta resolver el modelo SOCless?",
+    options: [
+      "La falta de herramientas de correlación en entornos híbridos",
+      "El exceso de falsos negativos generados por EDR",
+      "La sobrecarga de alertas y tareas manuales repetitivas en el SOC tradicional",
+      "La ausencia de visibilidad en endpoints remotos",
+    ],
+    answer: "C",
+  },
+  {
+    id: "m7-q5",
+    type: "multiple",
+    question: "La IA clasifica como benigno un login, pero luego se crea una regla de reenvío externa. ¿Qué indica esto?",
+    options: [
+      "Que la IA funcionó correctamente y el reenvío es un evento independiente",
+      "Que el modelo analizó los eventos de forma aislada y no detectó la secuencia como compromiso",
+      "Que el SIEM tiene reglas de correlación desactualizadas",
+      "Que el usuario tiene permisos excesivos que deben revisarse",
+    ],
+    answer: "B",
+  },
+  {
+    id: "m7-q6",
+    type: "multiple",
+    question: "Un score de riesgo marca 90/100, pero la actividad coincide con un cambio aprobado. ¿Qué harías?",
+    options: [
+      "Escalar automáticamente al equipo de respuesta a incidentes",
+      "Ignorar el score porque el cambio está documentado",
+      "Verificar usuario, horario y sistema contra el registro de cambios; si todo coincide, cerrar como falso positivo",
+      "Bloquear al usuario hasta confirmar manualmente con el solicitante",
+    ],
+    answer: "C",
+  },
+  {
+    id: "m7-q7",
+    type: "multiple",
+    question: "EDR detecta malware, VirusTotal muestra 0 detecciones y el archivo crea persistencia. ¿Qué evidencia pesa más?",
+    options: [
+      "VirusTotal con 0 detecciones, porque es la fuente con mayor cobertura de firmas",
+      "El comportamiento de persistencia detectado por EDR, porque supera la detección por firmas",
+      "Ambas evidencias tienen el mismo peso y se debe esperar más contexto",
+      "La detección de EDR es un falso positivo si VirusTotal no confirma",
+    ],
+    answer: "B",
+  },
+  {
+    id: "m7-q8",
+    type: "multiple",
+    question: "SOAR recomienda aislar un servidor productivo. Antes de ejecutar la acción, ¿qué validarías?",
+    options: [
+      "Solo el nombre del servidor y el tipo de alerta que disparó la recomendación",
+      "Si el servidor tiene antivirus actualizado y parches al día",
+      "Impacto de negocio, dueño del activo, dependencias activas y procedimiento de cambio",
+      "La cantidad de alertas similares en los últimos 30 días",
+    ],
+    answer: "C",
+  },
+  {
+    id: "m7-q9",
+    type: "multiple",
+    question: "¿Cuál NO es un riesgo real de depender excesivamente de herramientas, scores o IA?",
+    options: [
+      "Falsos negativos por confiar en scores bajos que ocultan amenazas reales",
+      "Atrofia analítica cuando los equipos pierden capacidad de investigar sin asistencia",
+      "Mayor velocidad de detección que elimina la necesidad de revisión humana",
+      "Superficie de ataque amplificada si un adversario aprende a manipular los modelos",
+    ],
+    answer: "C",
+  },
+  {
+    id: "m7-q10",
+    type: "multiple",
+    question: "¿Qué caracteriza a una decisión asistida por IA bien fundamentada?",
+    options: [
+      "Que la clasificación automática sea de alta confianza y no requiera revisión adicional",
+      "Que se base únicamente en el score de riesgo calculado por el modelo",
+      "Que integre evidencia técnica correlacionada y no dependa solo de la clasificación automática",
+      "Que el analista valide solo los casos marcados como críticos por la IA",
+    ],
+    answer: "C",
+  },
+];
+
+// ── Módulo 8 ────────────────────────────────────────────────────────────────
+const MODULO_8 = [
+  {
+    id: "m8-q1",
+    type: "multiple",
+    question: "Un cliente te pide que incluyas en el informe una vulnerabilidad que no pudiste confirmar, para “fortalecer el caso”. ¿Qué harías?",
+    options: [
+      "La incluís con una nota aclaratoria de que es preliminar",
+      "La omitís del informe y documentás solo lo confirmado con evidencia",
+      "La incluís si el cliente insiste, porque es su decisión final",
+      "Consultás con tu equipo si incluirla podría beneficiar al cliente",
+    ],
+    answer: "B",
+  },
+  {
+    id: "m8-q2",
+    type: "multiple",
+    question: "¿Cuál es la diferencia entre comunicación técnica y comunicación ejecutiva en ciberseguridad?",
+    options: [
+      "La comunicación ejecutiva incluye más detalles técnicos para mayor credibilidad",
+      "La técnica describe el “cómo”; la ejecutiva traduce el impacto al negocio sin jerga",
+      "Son equivalentes; solo cambia el canal de entrega",
+      "La ejecutiva se usa solo en incidentes críticos, no en reportes rutinarios",
+    ],
+    answer: "B",
+  },
+  {
+    id: "m8-q3",
+    type: "multiple",
+    question: "Encontrás una vulnerabilidad crítica en un sistema de un cliente durante un engagement autorizado. ¿Cuál es el paso correcto?",
+    options: [
+      "Explotarla para demostrar el impacto real antes de reportarla",
+      "Reportarla de inmediato al contacto designado sin explotarla más allá del scope",
+      "Esperar al informe final para no interrumpir el flujo del trabajo",
+      "Publicarla en 24 horas si el cliente no responde",
+    ],
+    answer: "B",
+  },
+  {
+    id: "m8-q4",
+    type: "multiple",
+    question: "¿Qué implica el concepto de “responsible disclosure” en el ámbito profesional?",
+    options: [
+      "Publicar la vulnerabilidad de inmediato para presionar al fabricante a parchear",
+      "Notificar al afectado con tiempo razonable para remediar antes de cualquier divulgación pública",
+      "Compartir la vulnerabilidad solo con la comunidad de investigadores de confianza",
+      "Reportarla directamente a medios especializados para generar visibilidad",
+    ],
+    answer: "B",
+  },
+  {
+    id: "m8-q5",
+    type: "truefalse",
+    question: "Indicá si la siguiente afirmación es verdadera o falsa.",
+    statement: "Un profesional de ciberseguridad puede usar técnicas ofensivas fuera de un scope autorizado si cree que el objetivo es malicioso.",
+    options: VF,
+    answer: "B",
+  },
+  {
+    id: "m8-q6",
+    type: "multiple",
+    question: "¿Qué caracteriza a un informe de seguridad de calidad profesional?",
+    options: [
+      "Extensión máxima, detalle técnico exhaustivo y capturas de pantalla en cada paso",
+      "Hallazgos confirmados, clasificados por riesgo, con evidencia y recomendaciones accionables",
+      "Lenguaje técnico preciso orientado al equipo de desarrollo del cliente",
+      "Foco exclusivo en vulnerabilidades críticas, omitiendo hallazgos de severidad media o baja",
+    ],
+    answer: "B",
+  },
+  {
+    id: "m8-q7",
+    type: "multiple",
+    question: "Un colega comparte credenciales de acceso a un sistema cliente por Slack “para agilizar el trabajo”. ¿Qué harías?",
+    options: [
+      "Las usás y le pedís que la próxima vez use un canal más seguro",
+      "Las ignorás y seguís con tus propias credenciales sin decir nada",
+      "Le indicás que eso viola la política de manejo de credenciales y lo reportás internamente",
+      "Las guardás temporalmente en un gestor de contraseñas personal",
+    ],
+    answer: "C",
+  },
+  {
+    id: "m8-q8",
+    type: "multiple",
+    question: "¿Cuál es el riesgo principal de la “normalización de la desviación” en un equipo de seguridad?",
+    options: [
+      "Que los analistas adopten demasiadas herramientas nuevas sin capacitación previa",
+      "Que malas prácticas repetidas sin consecuencias se vuelvan el estándar aceptado del equipo",
+      "Que los procesos formales retrasen la respuesta ante incidentes críticos",
+      "Que el equipo pierda foco en amenazas externas por exceso de auditorías internas",
+    ],
+    answer: "B",
+  },
+  {
+    id: "m8-q9",
+    type: "truefalse",
+    question: "Indicá si la siguiente afirmación es verdadera o falsa.",
+    statement: "Mantener actualizadas tus certificaciones y conocimientos es una responsabilidad opcional en ciberseguridad, ya que las empresas proveen capacitación interna.",
+    options: VF,
+    answer: "B",
+  },
+  {
+    id: "m8-q10",
+    type: "multiple",
+    question: "Recibís acceso a información confidencial de un cliente que no es necesaria para el trabajo encargado. ¿Qué harías?",
+    options: [
+      "La analizás por si resulta útil para el engagement",
+      "La almacenás de forma segura por si se necesita más adelante",
+      "Notificás al cliente del acceso excesivo y no procesás esa información",
+      "La compartís solo con el líder técnico del proyecto para evaluarla",
+    ],
+    answer: "C",
+  },
+];
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  ÁRBOL DE PREGUNTAS — una entrada por módulo, en orden (modulo1 … modulo8)
@@ -653,8 +886,8 @@ const BANCO_PREGUNTAS = {
   modulo4: MODULO_4,
   modulo5: MODULO_5,
   modulo6: MODULO_6,
-  modulo7: placeholderFrom(MODULO_6, 7), // ⚠️ PLACEHOLDER — reemplazar por MODULO_7
-  modulo8: placeholderFrom(MODULO_6, 8), // ⚠️ PLACEHOLDER — reemplazar por MODULO_8
+  modulo7: MODULO_7,
+  modulo8: MODULO_8,
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
