@@ -42,7 +42,7 @@ const VALID_VIOLATION_REASONS = [
 // ── Integridad: salidas del examen ──────────────────────────────────────────
 // Salidas permitidas (minimizar, cambiar de ventana/pestaña, salir de pantalla
 // completa, capturas, extensiones inyectadas). A la última se cancela.
-const MAX_FOCUS_STRIKES  = 3;
+const MAX_FOCUS_STRIKES  = 2;
 const VALID_STRIKE_KINDS = [
   "fullscreen_exit", "tab_hidden", "window_blur", "screenshot", "extension_injected",
 ];

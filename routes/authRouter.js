@@ -14,9 +14,10 @@ const adminMiddleware = require("../middleware/adminMiddleware")
 const axios = require("axios")
 // BREVO
 const { BrevoClient } = require("@getbrevo/brevo");
-
 // Entorno
 const esProduccion = process.env.NODE_ENV === "production";
+// Models
+const { LegalConsent, LEGAL_DOCUMENTS } = require("../models/LegalConsent");
 
 const brevo = new BrevoClient({ apiKey: process.env.BREVO_API_KEY });
  
@@ -137,8 +138,17 @@ async function emailExistsInFirebase(email) {
 }
 
 // ─── POST /register ───────────────────────────────────────────────────────────
+// IP real del cliente detrás de Cloudflare + Render
+const getClientIp = (req) => {
+    const cfIp = req.headers["cf-connecting-ip"];
+    if (cfIp) return String(cfIp);
+    const forwarded = req.headers["x-forwarded-for"];
+    if (forwarded) return String(forwarded).split(",")[0].trim();
+    return req.ip || null;
+};
+
 authRouter.post("/register", async (req, res) => {
-    const { email, password } = req.body
+    const { email, password, acceptedLegal } = req.body
     const regex = /^(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{10,}$/;
     try {
         if(!email || !password){
@@ -149,7 +159,41 @@ authRouter.post("/register", async (req, res) => {
             return res.status(400).json({ message: "Password does not meet security requirements! 🔴" });
         }
 
-        await auth.createUser({ email, password })
+        // Estricto: tiene que llegar exactamente true (no "true", no 1)
+        if (acceptedLegal !== true) {
+            return res.status(400).json({
+                code: "LEGAL_NOT_ACCEPTED",
+                message: "Legal documents must be accepted to register! 🔴"
+            });
+        }
+
+        const userRecord = await auth.createUser({ email, password })
+
+        // Guardar el consentimiento. Si falla, se borra el usuario:
+        // no puede existir una cuenta sin constancia de aceptación.
+        try {
+            await LegalConsent.create({
+                uid: userRecord.uid,
+                email,
+                accepted: true,
+                source: "register",
+                documents: Object.entries(LEGAL_DOCUMENTS).map(([type, doc]) => ({
+                    type,
+                    version: doc.version,
+                    url: doc.url,
+                })),
+                ip: getClientIp(req),
+                userAgent: req.headers["user-agent"]?.slice(0, 500) || null,
+            });
+        } catch (consentErr) {
+            console.error(esProduccion ? "Error saving legal consent! 🔴" : `Error saving legal consent! 🔴 ${consentErr}`);
+            try {
+                await auth.deleteUser(userRecord.uid);
+            } catch (rollbackErr) {
+                console.error(esProduccion ? "Rollback failed! 🔴" : `Rollback failed! 🔴 ${rollbackErr}`);
+            }
+            return res.status(500).send({ message: `Error creating user! 🔴` })
+        }
 
         // Enviar email de verificación — Firebase lo manda directamente
         try {
@@ -173,7 +217,7 @@ authRouter.post("/register", async (req, res) => {
 
 // ─── POST /login ──────────────────────────────────────────────────────────────
 authRouter.post("/login", loginLimiter, async (req, res) => {
-    const { email, password } = req.body; 
+    const { email, password, acceptedLegal } = req.body;
 
     try {
         // 0. Verificar que el email existe antes de intentar autenticar
@@ -216,6 +260,37 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
                     message: "Debés verificar tu email antes de ingresar.",
                 });
             }
+        }
+
+        // 4.5 Verificar aceptación de documentos legales (versiones vigentes)
+        const hasValidConsent = await LegalConsent.exists({
+            uid,
+            $and: Object.entries(LEGAL_DOCUMENTS).map(([type, doc]) => ({
+                documents: { $elemMatch: { type, version: doc.version } }
+            }))
+        });
+
+        if (!hasValidConsent) {
+            if (acceptedLegal !== true) {
+                return res.status(403).json({
+                    code:    "auth/legal-not-accepted",
+                    message: "Debés aceptar los documentos legales para ingresar.",
+                });
+            }
+
+            await LegalConsent.create({
+                uid,
+                email:     decoded.email,
+                accepted:  true,
+                source:    "reaccept",
+                documents: Object.entries(LEGAL_DOCUMENTS).map(([type, doc]) => ({
+                    type,
+                    version: doc.version,
+                    url:     doc.url,
+                })),
+                ip:        getClientIp(req),
+                userAgent: req.headers["user-agent"]?.slice(0, 500) || null,
+            });
         }
 
         // 5. Limpiar intentos fallidos y auditar login exitoso
