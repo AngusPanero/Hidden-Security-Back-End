@@ -26,7 +26,7 @@ const PaymentsSchema = new mongoose.Schema({
     // ── Financiación y comisión (se calculan al crear la orden) ─────────────
     // Sin default a propósito: los pagos viejos no los tienen y el backend
     // los estima al listarlos (feeEstimated: true).
-    listAmount:   { type: Number },  // precio de lista de los items, sin recargo ni descuento
+    listAmount:   { type: Number, default: 0 },  // precio de lista de los items, sin recargo ni descuento
     interestFree: { type: Boolean }, // true = cuotas sin interés, la comisión de financiación la absorbe Hidden
     interestRate: { type: Number },  // recargo cobrado al cliente (0, 0.15, 0.30, 0.65)
     mpFeeRate:    { type: Number },  // comisión de MP aplicada (0.05 estándar, o la de la cuota si es sin interés)

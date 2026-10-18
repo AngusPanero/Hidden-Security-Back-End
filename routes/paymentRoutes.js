@@ -460,30 +460,22 @@ paymentsRouter.get("/all-tickets", adminMiddleware, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  🔧 DEV — POST /test-course-payment
 // ═══════════════════════════════════════════════════════════════════════════════
-// Sin validaciones de negocio: acepta cualquier combinación de planes y datos,
-// no cobra, no consume cupones y siempre aprueba. Sí escribe claims reales,
-// guarda el pago (isTest: true), notifica al admin y renueva la cookie.
-// ⚠️ Para producción: comentar o eliminar esta ruta completa.
-paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
+/* paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
     const { payer = {}, couponCode, installments } = req.body;
     const uid = req.user.uid;
 
     console.log("🧪 [CURSO_SIMULACIÓN] Iniciando proceso...");
 
-    // ── 1. ITEMS: único requisito, que sean planes que existan ────────────────
     const items = (Array.isArray(req.body.items) ? req.body.items : []).filter(i => VALID_PLANS.includes(i));
     if (items.length === 0)
         return res.status(400).json({ message: `Mandá al menos un plan válido: ${VALID_PLANS.join(', ')} 🔴`, code: "INVALID_PLAN" });
 
-    // Cualquier dato vacío queda en "N/A"
     const testValue = (v) => (v === undefined || v === null || String(v).trim() === '') ? "N/A" : String(v).trim();
 
     try {
-        // ── 2. LEER CLAIMS ────────────────────────────────────────────────────
         const userRecord    = await auth.getUser(uid);
         const currentClaims = userRecord.customClaims || {};
 
-        // ── 3. CUPÓN OPCIONAL (se aplica si existe, nunca se consume) ─────────
         let appliedDiscount    = 0;
         let couponScope        = null;
         let couponAllowedPlans = [];
@@ -499,7 +491,6 @@ paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
             }
         }
 
-        // ── 4. CALCULAR MONTO (cuotas inválidas → 1 pago) ─────────────────────
         const cuotas = INTERES_RATES.hasOwnProperty(String(installments)) ? Number(installments) : 1;
 
         const baseAmount       = items.reduce((acc, planId) => acc + (PLAN_PRICES[planId] || 0), 0);
@@ -524,8 +515,6 @@ paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
 
         console.log(`💰 base: $${baseAmount} | cuotas: ${cuotas} (recargo ${(tasaInteres * 100).toFixed(0)}%) | descuento: ${appliedDiscount}% | final: $${finalAmount}`);
 
-        // ── 5. ARMAR LA ORDEN ─────────────────────────────────────────────────
-        // Rama enterprise solo si la cuenta es enterprise Y el primer item es B2B
         const isEnterpriseOrder = !!currentClaims.isEnterprise && ENTERPRISE_PLANS.includes(items[0]);
 
         const nuevoPago = new PaymentsMongo({
@@ -556,21 +545,17 @@ paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
             couponConsumed: false,
         });
 
-        // ── 6. FIREBASE CUSTOM CLAIMS ─────────────────────────────────────────
         nuevoPago.expiresAt     = await applyPurchaseClaims(nuevoPago);
         nuevoPago.claimsApplied = true;
         nuevoPago.fulfillment   = 'done';
         nuevoPago.fulfilledAt   = new Date();
 
-        // ── 7. GUARDAR EN DB Y NOTIFICAR ──────────────────────────────────────
         await nuevoPago.save();
         try { notifyNewSale(nuevoPago); } catch (e) { console.error("⚠️ notifyNewSale falló:", e.message); }
         console.log("✅ Pago de prueba guardado en DB.");
 
-        // ── 8. RENOVAR COOKIE (claims nuevas sin re-login) ────────────────────
         await safeRefreshSession(uid, res);
 
-        // ── 9. RESPUESTA ──────────────────────────────────────────────────────
         return res.status(200).json({
             message:   "Simulación completada con éxito 🟢",
             isTest:    true,
@@ -585,7 +570,7 @@ paymentsRouter.post("/test-course-payment", verifyToken, async (req, res) => {
         console.error("❌ [SIMULACIÓN ERROR]:", error.message);
         return res.status(500).json({ message: "Error en la simulación 🔴", code: "INTERNAL_ERROR", details: error.message });
     }
-});
+}); */
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -600,9 +585,6 @@ paymentsRouter.post("/course-payment", verifyToken, async (req, res) => {
     // ── 0. DATOS BÁSICOS ──────────────────────────────────────────────────────
     if (!payer?.email || !Array.isArray(items) || items.length === 0)
         return res.status(400).json({ message: "Faltan datos: payer.email e items son requeridos 🔴", code: "MISSING_DATA" });
-
-    if (!token || !payment_method_id || !installments)
-        return res.status(400).json({ message: "Faltan datos de pago (token, payment_method_id, installments) 🔴", code: "MISSING_PAYMENT_DATA" });
 
     if (!idempotencyKey)
         return res.status(400).json({ message: "Falta idempotencyKey 🔴", code: "MISSING_IDEMPOTENCY_KEY" });
@@ -805,6 +787,9 @@ paymentsRouter.post("/course-payment", verifyToken, async (req, res) => {
 
         console.log(`💰 base: $${baseAmount} | cuotas: ${cuotas} (recargo ${(tasaInteres * 100).toFixed(0)}%) | descuento: ${appliedDiscount}% | final: $${finalAmount}`);
 
+        if (finalAmount > 0 && (!token || !payment_method_id || !installments))
+            return res.status(400).json({ message: "Faltan datos de pago (token, payment_method_id, installments) 🔴", code: "MISSING_PAYMENT_DATA" });
+
         // ── 9. REGISTRAR LA ORDEN ANTES DE COBRAR ─────────────────────────────
         // Si algo se cae después del cobro, el webhook la encuentra por external_reference.
         const orderData = {
@@ -822,12 +807,12 @@ paymentsRouter.post("/course-payment", verifyToken, async (req, res) => {
             items,
             amount:         finalAmount,
             cuotas,
-            listAmount:   { type: Number },
-            interestFree: { type: Boolean },
-            interestRate: { type: Number },
-            mpFeeRate:    { type: Number },
-            mpFeeAmount:  { type: Number },
-            netAmount:    { type: Number },
+            listAmount:   baseAmount,
+            interestFree: financing.interestFree,
+            interestRate: tasaInteres,
+            mpFeeRate:    financing.mpFeeRate,
+            mpFeeAmount:  financing.mpFeeAmount,
+            netAmount:    financing.netAmount,
             couponUsed:     couponCodeUsed,
             discount:       appliedDiscount,
             date:           new Date(),
@@ -840,6 +825,7 @@ paymentsRouter.post("/course-payment", verifyToken, async (req, res) => {
             claimsApplied:  false,
             couponConsumed: false,
         };
+        console.log("📊 financing:", financing);
 
         if (order) {
             // Reintento de una orden que quedó en 'error'
@@ -854,6 +840,35 @@ paymentsRouter.post("/course-payment", verifyToken, async (req, res) => {
                     return res.status(409).json({ message: "Ya hay un pago en curso con esta operación 🟡", code: "PAYMENT_IN_PROGRESS" });
                 throw e;
             }
+        }
+
+        // ── 9b. ORDEN GRATUITA (cupón 100%) → no pasa por MP ──────────────────
+        if (finalAmount === 0) {
+            order.status        = 'approved';
+            order.status_detail = 'free_coupon';
+            await order.save();
+
+            const result = await fulfillOrder(order._id);
+
+            if (!result.ok)
+                return res.status(202).json({
+                    message:   "Estamos activando tu plan 🟡",
+                    code:      "ACTIVATION_PENDING",
+                    mp_status: 'approved',
+                    mp_id:     null,
+                    amount:    0,
+                });
+
+            await safeRefreshSession(uid, res);
+
+            return res.status(200).json({
+                message:   "Plan activado con éxito 🟢",
+                mp_status: 'approved',
+                mp_id:     null,
+                amount:    0,
+                discount:  `${appliedDiscount}%`,
+                ...(await getFreshPurchaseClaims(uid)),
+            });
         }
 
         // ── 10. PROCESAR PAGO REAL EN MERCADO PAGO ────────────────────────────
