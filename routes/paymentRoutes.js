@@ -784,10 +784,11 @@ paymentsRouter.post("/course-payment", verifyToken, async (req, res) => {
 
         const finalAmount = Math.round(totalConInteres - discountAmount);
         const financing = calcFinancing({ cuotas, amount: finalAmount, cuotasSinInteres });
+        const isFreeOrder = finalAmount === 0 && !!couponCodeUsed && appliedDiscount === 100;
 
         console.log(`💰 base: $${baseAmount} | cuotas: ${cuotas} (recargo ${(tasaInteres * 100).toFixed(0)}%) | descuento: ${appliedDiscount}% | final: $${finalAmount}`);
 
-        if (finalAmount > 0 && (!token || !payment_method_id || !installments))
+        if (!isFreeOrder && (!token || !payment_method_id || !installments))
             return res.status(400).json({ message: "Faltan datos de pago (token, payment_method_id, installments) 🔴", code: "MISSING_PAYMENT_DATA" });
 
         // ── 9. REGISTRAR LA ORDEN ANTES DE COBRAR ─────────────────────────────
@@ -843,7 +844,7 @@ paymentsRouter.post("/course-payment", verifyToken, async (req, res) => {
         }
 
         // ── 9b. ORDEN GRATUITA (cupón 100%) → no pasa por MP ──────────────────
-        if (finalAmount === 0) {
+        if (isFreeOrder) {
             order.status        = 'approved';
             order.status_detail = 'free_coupon';
             await order.save();
@@ -892,6 +893,7 @@ paymentsRouter.post("/course-payment", verifyToken, async (req, res) => {
                     idempotencyKey,
                 },
             });
+               console.log("🧾 MP:", mpResult.status, mpResult.status_detail, mpResult.card?.cardholder?.name);
         } catch (mpError) {
             // 4xx de MP = request rechazado, seguro que no cobró → la key muere.
             // 5xx / red = no sabemos si cobró → se conserva la key para reintentar seguro.
