@@ -6,6 +6,9 @@ const verifyToken     = require("../middleware/authMiddleware");
 const auth             = require("../config/firebase");
 const { CERTIFICATIONS } = require("../config/certifications");
 const engine           = require("../services/socExamEngine");
+const { issueCertificate } = require("./publicCertificateRouter");
+
+const esProduccion = process.env.NODE_ENV === "production";
 
 // Chequeo al arrancar el server: si los modelos son los del motor de test,
 // Mongoose descartaría en silencio sequence/optionOrder/etc. y el examen
@@ -304,8 +307,20 @@ async function finalizeAttempt(cert, attempt, { timedOut = false } = {}) {
 
   const record = await CertificationRecord.findOne({ attemptId: attempt._id }).lean();
   if (closed && record) history.after = await getSummary(attempt.userId, attempt.certId, cert);
-  if (record?.result === "passed") await grantClaimForRecord(record);
-  return { record, history };
+    let certificate = null;
+
+  if (record?.result === "passed") {
+    await grantClaimForRecord(record);
+    certificate = await issueCertificate({
+      userId:    record.userId,
+      certId:    record.certId,
+      recordId:  record._id,
+      attemptId: record.attemptId,
+      score:     record.score,
+      issuedAt:  record.completedAt,
+    });
+  }
+  return { record, history, certificate };
 }
 
 async function closeIfExpired(attempt, cert) {
@@ -844,8 +859,9 @@ certificationRouter.post("/api/certification/:certId/submit", verifyToken, async
     }
 
     const timedOut = isExpired(attempt, NETWORK_GRACE_MS);
-    const { record, history } = await finalizeAttempt(cert, attempt, { timedOut });
-    res.json(resultPayload(cert, record, history));
+    const { record, history, certificate } = await finalizeAttempt(cert, attempt, { timedOut });
+
+    res.json({ ...resultPayload(cert, record, history), certificateUrl: certificate?.url ?? null });
   } catch (err) {
     console.error(esProduccion ? "Error POST /submit" : `Error POST /submit: ${err}`);
     res.status(500).json({ message: "Error al finalizar el examen" });

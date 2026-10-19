@@ -5437,7 +5437,7 @@
       "caseId": null,
       "module": "Análisis de Alertas y Eventos",
       "responseType": "single",
-      "text": "Pregunta (pensada para imagen de tráfico o tabla): Se observa el siguiente patrón de red: • conexiones salientes a la misma IP externa • intervalos regulares de tiempo • bajo volumen de datos • persistencia en el tiempo ¿Cuál es la interpretación más adecuada?",
+      "text": "Se observa el siguiente patrón de red: • conexiones salientes a la misma IP externa • intervalos regulares de tiempo • bajo volumen de datos • persistencia en el tiempo ¿Cuál es la interpretación más adecuada?",
       "options": [
         {
           "text": "El patrón puede indicar comportamiento automatizado que requiere análisis adicional",

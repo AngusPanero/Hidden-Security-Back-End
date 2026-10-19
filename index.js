@@ -25,6 +25,7 @@ const { sseHandler } = require("./sseManager/sseManajer")
 const { applicantSseHandler } = require("./sseManager/sseApplicants")
 const { userSseHandler } = require("./sseManager/sseUserNotifications");
 const courseRouter = require("./routes/courseRouter")
+const { publicCertificateRouter } = require("./routes/publicCertificateRouter")
 const app = express()
 const PORT = process.env.PORT
 
@@ -66,6 +67,7 @@ app.use(certificationRouter);
 app.use(corporativeMailingRouter);
 app.use(adminClaimsRouter);
 app.use(refreshClaimsRouter);
+app.use(publicCertificateRouter);
 
 app.use((req, res) => {
     res.send(`<h1>404 - Not Found</h1>`)

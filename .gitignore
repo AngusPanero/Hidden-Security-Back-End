@@ -56,3 +56,4 @@ makePartner.js
 certifySocCertif.js
 setPlanExpiry.js
 listClaims.js
+createTestCertificate.js
