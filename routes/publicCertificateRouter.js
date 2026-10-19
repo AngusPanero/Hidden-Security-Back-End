@@ -22,7 +22,7 @@ const express   = require("express");
 const crypto    = require("crypto");
 const rateLimit = require("express-rate-limit");
 
-const PublicCertificate   = require("../models/PublicCertificate");
+const PublicCertificate   = require("../models/Publiccertificate");
 const CertificationRecord = require("../models/CertificationRecord");
 const verifyToken         = require("../middleware/authMiddleware");
 const auth                = require("../config/firebase");
