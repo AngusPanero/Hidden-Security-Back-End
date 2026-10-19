@@ -1,8 +1,28 @@
+/* ══════════════════════════════════════════════════════════════════════════
+   publicCertificateRouter.js — certificados públicos verificables
+
+   Todo lo de certificados vive en este archivo:
+     • issueCertificate(...)          → se exporta y la llama certificationRouter
+                                        en el momento en que valida la aprobación.
+     • GET /api/public-certificates/:credentialId
+                                      → PÚBLICA. La consume la página
+                                        /certifications/modernSoc/:credentialId
+                                        (y es lo que abre quien escanea el QR).
+     • GET /api/certificates/mine     → con sesión. Devuelve los certificados del
+                                        alumno con su link, para mostrarlos en el
+                                        dashboard o en la pantalla de resultado.
+                                        Si el alumno aprobó ANTES de que existiera
+                                        este sistema, se le emite acá (backfill).
+
+   Montaje en index.js:
+     const { publicCertificateRouter } = require("./routes/publicCertificateRouter");
+     app.use(publicCertificateRouter);
+══════════════════════════════════════════════════════════════════════════ */
 const express   = require("express");
 const crypto    = require("crypto");
 const rateLimit = require("express-rate-limit");
 
-const PublicCertificate   = require("../models/Publiccertificate");
+const PublicCertificate   = require("../models/PublicCertificate");
 const CertificationRecord = require("../models/CertificationRecord");
 const verifyToken         = require("../middleware/authMiddleware");
 const auth                = require("../config/firebase");
@@ -219,7 +239,9 @@ publicCertificateRouter.get("/api/certificates/mine", verifyToken, async (req, r
     }
 
     const docs = await PublicCertificate.find({ userId: uid }).sort({ issuedAt: -1 }).lean();
-    res.json({ certificates: docs.map(publicView) });
+    // certId solo en esta ruta privada (la pública no lo expone): el front
+    // lo usa para saber qué card del catálogo corresponde a cada certificado.
+    res.json({ certificates: docs.map(d => ({ ...publicView(d), certId: d.certId })) });
   } catch (err) {
     console.error("Error listando certificados 🔴", esProduccion ? "" : err);
     res.status(500).json({ message: "Error al obtener tus certificados" });
