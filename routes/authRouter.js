@@ -149,9 +149,9 @@ const getClientIp = (req) => {
 
 authRouter.post("/register", async (req, res) => {
     const { email, password, acceptedLegal } = req.body
-    const regex = /^(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{10,}$/;
+    const regex = /^(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+=[\]{};':"\\|,.<>/?`~-]).{10,}$/;
     try {
-        if(!email || !password){
+        if (!email || typeof password !== "string"){
             return res.status(400).json({ message: "All fields are required to create an user! 🔴" })
         }
 
