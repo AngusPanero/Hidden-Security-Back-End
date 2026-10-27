@@ -122,7 +122,7 @@ const CATEGORY_WEIGHTS = { roles: 0.30, habilidades: 0.40, herramientas: 0.30 };
 // │ debajo se sugiere. Los postulados se devuelven siempre todos.           │
 // │ El front lo recibe en la respuesta (minScore), no hace falta tocarlo.   │
 // └──────────────────────────────────────────────────────────────────────────┘
-const MIN_MATCH_SCORE = 50;
+const MIN_MATCH_SCORE = 65;
 
 const MAX_SUGGESTIONS      = 100;  // tope de sugeridos que se devuelven (el front pagina)
 const MAX_SUGGESTION_SCAN  = 500;  // CVs que se evalúan como máximo
