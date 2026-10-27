@@ -4,6 +4,10 @@ const CourseProgress = require("../models/CourseSchema");
 const verifyToken    = require("../middleware/authMiddleware");
 const auth           = require("../config/firebase");
 const { COURSES, VALID_COURSE_IDS, getQuizModuleNumber } = require("../config/courses");
+const fs = require("fs");
+const path = require("path");
+const { pipeline } = require("stream/promises");
+const { SOC1_CONTENT_DIR, SOC1_PDF_BY_STEP } = require("../config/soc1Content");
 
 const esProduccion = process.env.NODE_ENV === "production";
 
@@ -333,6 +337,68 @@ courseRouter.get("/api/course/progress-summary", verifyToken, async (req, res) =
     console.error("Error GET progress-summary:", err);
     res.status(500).json({ message: "Error al obtener resumen de progreso" });
   }
+});
+
+// ── PDF protegido del curso SOC ──────────────────────────────────────
+// Solo con sesión, membresía activa y step desbloqueado.
+courseRouter.get("/api/course/:courseId/content/:stepIndex", verifyToken, async (req, res) => {
+    try {
+        const { courseId } = req.params;
+        const stepIndex = Number(req.params.stepIndex);
+
+        if (courseId !== "soc1") return res.status(404).json({ message: "Curso no encontrado" });
+
+        const relFile = SOC1_PDF_BY_STEP.get(stepIndex);
+        if (!Number.isInteger(stepIndex) || !relFile) {
+            return res.status(404).json({ message: "Contenido no encontrado" });
+        }
+
+        const user = req.user;
+        const isAdmin = user.admin === true;
+
+        // ⚠️ 1) MEMBRESÍA: usá la MISMA validación que ya tenés en GET /progress.
+        //    Si ahí llamás a una función (ej: hasActiveMembership), llamala acá.
+        //    Esto es el equivalente con purchases + purchaseExpiry de las claims:
+        if (!isAdmin) {
+            const purchases = Array.isArray(user.purchases) ? user.purchases : [];
+            const expiry = user.purchaseExpiry || {};
+            const active = purchases.some(
+                (p) => p !== "voucher" && expiry[p] && new Date(expiry[p]) > new Date()
+            );
+            if (!active) return res.status(403).json({ message: "Necesitás una membresía activa." });
+        }
+
+        // ⚠️ 2) STEP DESBLOQUEADO: usá tu modelo de progreso (el mismo de /progress)
+        if (!isAdmin) {
+            const progress = await CourseProgress.findOne({ userId: user.uid, courseId }).lean();
+            const completed = progress?.completedSteps ?? [];
+            const current = progress?.currentStep ?? 0;
+            if (stepIndex > current && !completed.includes(stepIndex)) {
+                return res.status(403).json({ message: "Completá la etapa anterior para desbloquear." });
+            }
+        }
+
+        const filePath = path.resolve(SOC1_CONTENT_DIR, relFile);
+        if (!filePath.startsWith(SOC1_CONTENT_DIR + path.sep)) {
+            return res.status(400).json({ message: "Ruta inválida" });
+        }
+
+        const stat = await fs.promises.stat(filePath).catch(() => null);
+        if (!stat) return res.status(404).json({ message: "Archivo no encontrado" });
+
+        res.set({
+            "Content-Type": "application/pdf",
+            "Content-Length": stat.size,
+            "Content-Disposition": "inline",
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        });
+
+        await pipeline(fs.createReadStream(filePath), res);
+    } catch (error) {
+        console.error("Error sirviendo PDF:", error);
+        if (!res.headersSent) res.status(500).json({ message: "Error interno" });
+    }
 });
 
 module.exports = courseRouter;

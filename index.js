@@ -21,21 +21,19 @@ const adminMiddleware = require("./middleware/adminMiddleware")
 const enterpriseMiddleware = require("./middleware/enterpriseMiddleware")
 const certifiedMiddleware = require("./middleware/certificatedMiddleware")
 const authMiddleware = require("./middleware/authMiddleware")
+const { statusRoute, maintenanceGuard } = require("./middleware/maintenance")
 const { sseHandler } = require("./sseManager/sseManajer")
 const { applicantSseHandler } = require("./sseManager/sseApplicants")
-const { userSseHandler } = require("./sseManager/sseUserNotifications");
+const { userSseHandler } = require("./sseManager/sseUserNotifications")
 const courseRouter = require("./routes/courseRouter")
 const { publicCertificateRouter } = require("./routes/publicCertificateRouter")
 const learningProgressRouter = require("./routes/learningProgressRouter")
 const presenceRouter = require("./routes/presenceRouter")
+const externalCoursesRouter = require("./externalCourses/_core/externalCoursesRouter")
 const app = express()
 const PORT = process.env.PORT
 
 app.set('trust proxy', 1); // Para el Rate Limiter
-app.use(urlencoded({ extended: true }))
-
-app.use(express.json())
-app.use(cookieParser())
 
 dbConnection()
 
@@ -46,13 +44,19 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }))
 
+app.get("/api/status", statusRoute)
+app.use(maintenanceGuard)
+
+app.use(urlencoded({ extended: true }))
+app.use(express.json())
+app.use(cookieParser())
+
 app.get("/api/payments/stream", adminMiddleware, sseHandler);
 app.get("/api/vacancy/applicants/stream", enterpriseMiddleware, applicantSseHandler);
 
 const REQUIRE_CERTIFICATION = false; // Cambiar a true si se requiere certificación para aplicar a vacantes
 const applyGuard = REQUIRE_CERTIFICATION ? certifiedMiddleware : authMiddleware;
 
-app.get("/api/user/notifications/stream", applyGuard, userSseHandler);
 app.get("/api/user/notifications/stream", applyGuard, userSseHandler);
 
 app.use(cvRouter)
@@ -72,6 +76,7 @@ app.use(refreshClaimsRouter);
 app.use(publicCertificateRouter);
 app.use(learningProgressRouter)
 app.use(presenceRouter)
+app.use(externalCoursesRouter);
 
 app.use((req, res) => {
     res.send(`<h1>404 - Not Found</h1>`)
