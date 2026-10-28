@@ -401,7 +401,7 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
             uid: uid,
             email: decoded.email,
             event: "login",
-            ip: req.ip,
+            ip: getClientIp(req), // IP real detrás de Cloudflare + Render
             userAgent: req.headers["user-agent"]
         });
 
@@ -518,7 +518,8 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
 })
 
 // ─── POST /resend-verification ────────────────────────────────────────────────
-authRouter.post("/resend-verification", async (req, res) => {
+// Rate limit: sin esto cualquiera puede disparar mails de Brevo en loop
+authRouter.post("/resend-verification", loginLimiter, async (req, res) => {
     const { email } = req.body;
 
     if (!email) {
@@ -558,7 +559,7 @@ authRouter.post("/logout", async (req, res) => {
                 uid: decoded.uid,
                 email: decoded.email,
                 event: "logout",
-                ip: req.ip || req.headers['x-forwarded-for'],
+                ip: getClientIp(req), // IP real detrás de Cloudflare + Render
                 userAgent: req.headers["user-agent"]
             });
         }
@@ -713,11 +714,34 @@ authRouter.get("/me", verifyToken, checkBanned, async (req, res) => {
     }
 });
 
-authRouter.post("/admin/verify-access", verifyToken, async (req, res) => {
+const PROTECTED_ZONES = {
+    admin: {
+        claim:  "admin",
+        type:   "unauthorized-admin-access",
+        reason: "Unauthorized admin access attempt",
+    },
+    enterprise: {
+        claim:  "isEnterprise",
+        type:   "unauthorized-enterprise-access",
+        reason: "Unauthorized enterprise access attempt",
+    },
+    partner: {
+        claim:  "partner",
+        type:   "unauthorized-partner-access",
+        reason: "Unauthorized partner access attempt",
+    },
+};
+ 
+// Lo llama cada dashboard protegido al montar. Si el token firmado NO tiene
+// el rol de la zona, alguien llegó al panel manipulando respuestas (Burp):
+// se registra el incidente, se banea la cuenta, se revocan sus sesiones y
+// se borra la cookie.
+const verifyZoneAccess = (zoneKey) => async (req, res) => {
+    const zone    = PROTECTED_ZONES[zoneKey];
     const decoded = req.user;
  
-    // Admin real (según el token verificado y firmado por Firebase)
-    if (decoded.admin === true && decoded.banned !== true) {
+    // Acceso legítimo (según el token verificado y firmado por Firebase)
+    if (decoded[zone.claim] === true && decoded.banned !== true) {
         return res.status(200).json({ ok: true });
     }
  
@@ -728,41 +752,48 @@ authRouter.post("/admin/verify-access", verifyToken, async (req, res) => {
     try {
         userRecord = await auth.getUser(decoded.uid);
     } catch (err) {
-        console.error(esProduccion ? "verify-access getUser failed 🔴" : `verify-access getUser failed 🔴 ${err}`);
+        console.error(esProduccion ? "verify-zone getUser failed 🔴" : `verify-zone getUser failed 🔴 ${err}`);
     }
+    const currentClaims = userRecord?.customClaims || {};
  
-    // Caso legítimo: lo acaban de hacer admin y su token todavía es el viejo.
+    // Caso legítimo: le acaban de dar el rol y su token todavía es el viejo.
     // No es un ataque → no se banea, solo se pide volver a iniciar sesión.
-    if (userRecord?.customClaims?.admin === true && userRecord?.customClaims?.banned !== true) {
+    if (currentClaims[zone.claim] === true && currentClaims.banned !== true) {
         return res.status(409).json({ code: "SESSION_REFRESH_REQUIRED", message: "Volvé a iniciar sesión." });
     }
  
     // ── Ban (merge: conserva compras y demás claims) ─────────────────────────
+    // Nunca se banea automáticamente una cuenta admin: se registra el
+    // incidente igual, pero así no te podés dejar afuera vos mismo.
     let actionTaken = "banned";
     let actionError = null;
     try {
-        if (decoded.banned === true || userRecord?.customClaims?.banned === true) {
+        if (currentClaims.admin === true || decoded.admin === true) {
+            actionTaken = "skipped-admin";
+        } else if (decoded.banned === true || currentClaims.banned === true) {
             actionTaken = "already-banned";
+            await auth.revokeRefreshTokens(decoded.uid);
         } else {
             await auth.setCustomUserClaims(decoded.uid, {
-                ...(userRecord?.customClaims || {}),
-                banned: true,
-                bannedAt: now,
-                bannedReason: "Unauthorized admin access attempt",
+                ...currentClaims,
+                banned:       true,
+                bannedAt:     now,
+                bannedReason: zone.reason,
             });
+            await auth.revokeRefreshTokens(decoded.uid);
         }
-        await auth.revokeRefreshTokens(decoded.uid);
     } catch (err) {
         actionTaken = "ban-failed";
         actionError = str(err?.message, 500);
-        console.error(esProduccion ? "verify-access ban failed 🔴" : `verify-access ban failed 🔴 ${err}`);
+        console.error(esProduccion ? "verify-zone ban failed 🔴" : `verify-zone ban failed 🔴 ${err}`);
     }
  
     // ── Registro del incidente ───────────────────────────────────────────────
     let incidentId = null;
     try {
         const incident = await SecurityIncident.create({
-            type:             "unauthorized-admin-access",
+            type:             zone.type,
+            zone:             zoneKey,
             uid:              decoded.uid,
             email:            decoded.email || userRecord?.email || null,
             emailVerified:    userRecord?.emailVerified ?? decoded.email_verified ?? null,
@@ -809,26 +840,36 @@ authRouter.post("/admin/verify-access", verifyToken, async (req, res) => {
             event:     "security-threat",
             ip:        getClientIp(req),
             userAgent: req.headers["user-agent"],
-            metadata:  { reason: "unauthorized-admin-access", incidentId, actionTaken },
+            metadata:  { reason: zone.type, incidentId, actionTaken },
         });
     } catch (err) {
         console.error(esProduccion ? "Audit security-threat failed 🔴" : `Audit security-threat failed 🔴 ${err}`);
     }
  
-    console.warn(`🚨 SECURITY_THREAT // unauthorized admin access uid=${decoded.uid} email=${decoded.email} ip=${getClientIp(req)} action=${actionTaken}`);
+    console.warn(`🚨 SECURITY_THREAT // ${zone.type} uid=${decoded.uid} email=${decoded.email} ip=${getClientIp(req)} action=${actionTaken}`);
  
-    // ── Cerrar la sesión en el navegador ─────────────────────────────────────
-    res.clearCookie("idToken", esProduccion
-        ? { httpOnly: true, sameSite: "lax", secure: true, domain: ".hidden-security.org", path: "/" }
-        : { httpOnly: true, sameSite: "none", secure: true, path: "/" }
-    );
+    // ── Cerrar la sesión en el navegador (salvo admin, que no se banea) ──────
+    if (actionTaken !== "skipped-admin") {
+        res.clearCookie("idToken", esProduccion
+            ? { httpOnly: true, sameSite: "lax", secure: true, domain: ".hidden-security.org", path: "/" }
+            : { httpOnly: true, sameSite: "none", secure: true, path: "/" }
+        );
+    }
  
     return res.status(403).json({
         code:    "SECURITY_THREAT",
-        message: "Unauthorized admin access attempt detected.",
+        message: "Unauthorized access attempt detected.",
         incidentId,
     });
-});
+};
+ 
+// ─── POST /admin/verify-access ─────────────────────────────────── (AdminDashboard)
+authRouter.post("/admin/verify-access", verifyToken, verifyZoneAccess("admin"));
+ 
+// ─── POST /security/verify-enterprise-access ───────────────── (EnterpriseDashboard)
+authRouter.post("/security/verify-enterprise-access", verifyToken, verifyZoneAccess("enterprise"));
+
+authRouter.post("/security/verify-partner-access", verifyToken, verifyZoneAccess("partner"));
 
 authRouter.post("/reset-password", loginLimiter, async (req, res) => {
     const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";

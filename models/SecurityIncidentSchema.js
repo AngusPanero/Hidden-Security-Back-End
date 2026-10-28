@@ -1,15 +1,17 @@
 const mongoose = require("mongoose");
 
-// Registro de intentos de acceso no autorizado a zonas protegidas (ej: /admin).
-// Nunca se guarda el token ni la contraseña: solo datos para identificar al autor.
+// Registro de intentos de acceso no autorizado a zonas protegidas
+// (panel admin, panel enterprise, panel partner). Nunca se guarda el token ni la contraseña:
+// solo datos para identificar al autor.
 const SecurityIncidentSchema = new mongoose.Schema(
     {
         type: {
             type: String,
-            enum: ["unauthorized-admin-access"],
+            enum: ["unauthorized-admin-access", "unauthorized-enterprise-access", "unauthorized-partner-access"],
             default: "unauthorized-admin-access",
             index: true,
         },
+        zone: { type: String, enum: ["admin", "enterprise", "partner"], default: "admin", index: true },
 
         // ── Quién ────────────────────────────────────────────────────────────
         uid:            { type: String, required: true, index: true },
@@ -30,7 +32,7 @@ const SecurityIncidentSchema = new mongoose.Schema(
         // ── Qué intentó ──────────────────────────────────────────────────────
         method:         { type: String, default: null },
         endpoint:       { type: String, default: null }, // endpoint que lo detectó
-        attemptedPath:  { type: String, default: null }, // ruta del front (/admin)
+        attemptedPath:  { type: String, default: null }, // ruta del front (/admin, /enterprise)
         attemptedTab:   { type: String, default: null },
 
         // ── Qué decía su token firmado (la verdad del servidor) ──────────────
@@ -47,7 +49,7 @@ const SecurityIncidentSchema = new mongoose.Schema(
         // ── Respuesta del sistema ────────────────────────────────────────────
         actionTaken: {
             type: String,
-            enum: ["banned", "already-banned", "ban-failed"],
+            enum: ["banned", "already-banned", "ban-failed", "skipped-admin"],
             default: "banned",
         },
         actionError:    { type: String, default: null },
