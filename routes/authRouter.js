@@ -5,6 +5,8 @@ const authRouter = express.Router()
 const auth = require("../config/firebase")
 // Models
 const Audit = require("../models/AuditSchema")
+const SecurityIncident = require("../models/SecurityIncidentSchema");
+const { LegalConsent, LEGAL_DOCUMENTS } = require("../models/LegalConsent");
 // Middlewares
 const loginLimiter = require("../middleware/rateLimitMiddleware")
 const checkBanned = require("../middleware/checkBanned")
@@ -16,8 +18,6 @@ const axios = require("axios")
 const { BrevoClient } = require("@getbrevo/brevo");
 // Entorno
 const esProduccion = process.env.NODE_ENV === "production";
-// Models
-const { LegalConsent, LEGAL_DOCUMENTS } = require("../models/LegalConsent");
 
 const brevo = new BrevoClient({ apiKey: process.env.BREVO_API_KEY });
  
@@ -381,7 +381,10 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
                 if (attempt.attempts >= 5) {
                     try {
                         const userRecord = await auth.getUserByEmail(userEmail);
+                        // Merge con las claims existentes: setCustomUserClaims
+                        // REEMPLAZA todo el objeto (borraría admin, purchases, etc.)
                         await auth.setCustomUserClaims(userRecord.uid, {
+                            ...(userRecord.customClaims || {}),
                             banned: true,
                             bannedAt: now,
                             bannedReason: "Too many failed login attempts"
@@ -495,7 +498,9 @@ authRouter.post("/admin/ban-user", adminMiddleware, async (req, res) => {
     try {
         const now = Date.now()
         const user = await auth.getUserByEmail(email)
+        // Merge con las claims existentes para no perder roles ni compras
         await auth.setCustomUserClaims(user.uid, {
+            ...(user.customClaims || {}),
             banned: true,
             bannedAt: now,
             bannedReason: "Banned directly by admin."
@@ -516,7 +521,9 @@ authRouter.post("/unban-user", adminMiddleware, async (req, res) => {
     }
     try {
         const user = await auth.getUser(uid)
-        await auth.setCustomUserClaims(uid, { banned: false })
+        // Quita solo los datos del baneo y conserva el resto de las claims
+        const { banned, bannedAt, bannedReason, ...restClaims } = user.customClaims || {};
+        await auth.setCustomUserClaims(uid, { ...restClaims, banned: false })
         await auth.revokeRefreshTokens(uid)
         await Audit.findOneAndUpdate(
             { uid, event: "login-failed" },
@@ -537,12 +544,12 @@ authRouter.post("/unban-user", adminMiddleware, async (req, res) => {
 
 // ─── GET /check-auth ──────────────────────────────────────────────────────────
 authRouter.get("/check-auth", verifyToken, async (req, res) => {
-    const idToken = req.cookies.idToken;
-    if (!idToken) {
-        return res.status(401).json({ authenticated: false });
-    }
     try {
-        const decoded = await auth.verifyIdToken(idToken);
+        // verifyToken ya validó el token (con checkRevoked) y dejó las claims en req.user
+        const decoded = req.user;
+        if (!decoded?.uid) {
+            return res.status(401).json({ authenticated: false });
+        }
 
         const userPayload = {
             uid:                   decoded.uid,
@@ -576,10 +583,10 @@ authRouter.get("/check-auth", verifyToken, async (req, res) => {
 
 // ─── GET /me ──────────────────────────────────────────────────────────────────
 authRouter.get("/me", verifyToken, checkBanned, async (req, res) => {
-    const idToken = req.cookies.idToken; 
-    if (!idToken) return res.status(401).json({ message: "No token" });
     try {
-        const decoded = await auth.verifyIdToken(idToken);
+        // verifyToken ya validó el token (con checkRevoked) y dejó las claims en req.user
+        const decoded = req.user;
+        if (!decoded?.uid) return res.status(401).json({ message: "No token" });
         if (decoded.banned) {
             return res.status(403).json({ message: "Banned" });
         }
@@ -607,5 +614,123 @@ authRouter.get("/me", verifyToken, checkBanned, async (req, res) => {
         return res.status(401).json({ message: "Invalid token" });
     }
 });
+
+authRouter.post("/admin/verify-access", verifyToken, async (req, res) => {
+    const decoded = req.user;
+ 
+    // Admin real (según el token verificado y firmado por Firebase)
+    if (decoded.admin === true && decoded.banned !== true) {
+        return res.status(200).json({ ok: true });
+    }
+ 
+    const now = Date.now();
+    const str = (v, max = 300) => (v == null ? null : String(v).slice(0, max));
+ 
+    let userRecord = null;
+    try {
+        userRecord = await auth.getUser(decoded.uid);
+    } catch (err) {
+        console.error(esProduccion ? "verify-access getUser failed 🔴" : `verify-access getUser failed 🔴 ${err}`);
+    }
+ 
+    // Caso legítimo: lo acaban de hacer admin y su token todavía es el viejo.
+    // No es un ataque → no se banea, solo se pide volver a iniciar sesión.
+    if (userRecord?.customClaims?.admin === true && userRecord?.customClaims?.banned !== true) {
+        return res.status(409).json({ code: "SESSION_REFRESH_REQUIRED", message: "Volvé a iniciar sesión." });
+    }
+ 
+    // ── Ban (merge: conserva compras y demás claims) ─────────────────────────
+    let actionTaken = "banned";
+    let actionError = null;
+    try {
+        if (decoded.banned === true || userRecord?.customClaims?.banned === true) {
+            actionTaken = "already-banned";
+        } else {
+            await auth.setCustomUserClaims(decoded.uid, {
+                ...(userRecord?.customClaims || {}),
+                banned: true,
+                bannedAt: now,
+                bannedReason: "Unauthorized admin access attempt",
+            });
+        }
+        await auth.revokeRefreshTokens(decoded.uid);
+    } catch (err) {
+        actionTaken = "ban-failed";
+        actionError = str(err?.message, 500);
+        console.error(esProduccion ? "verify-access ban failed 🔴" : `verify-access ban failed 🔴 ${err}`);
+    }
+ 
+    // ── Registro del incidente ───────────────────────────────────────────────
+    let incidentId = null;
+    try {
+        const incident = await SecurityIncident.create({
+            type:             "unauthorized-admin-access",
+            uid:              decoded.uid,
+            email:            decoded.email || userRecord?.email || null,
+            emailVerified:    userRecord?.emailVerified ?? decoded.email_verified ?? null,
+            accountCreatedAt: userRecord?.metadata?.creationTime ? new Date(userRecord.metadata.creationTime) : null,
+            lastSignInAt:     userRecord?.metadata?.lastSignInTime ? new Date(userRecord.metadata.lastSignInTime) : null,
+ 
+            ip:             getClientIp(req),
+            ipChain:        str(req.headers["x-forwarded-for"]),
+            country:        str(req.headers["cf-ipcountry"], 10),
+            userAgent:      str(req.headers["user-agent"], 500),
+            acceptLanguage: str(req.headers["accept-language"], 200),
+            referer:        str(req.headers["referer"], 500),
+            origin:         str(req.headers["origin"], 200),
+ 
+            method:        req.method,
+            endpoint:      str(req.originalUrl, 200),
+            attemptedPath: str(req.body?.path, 200),
+            attemptedTab:  str(req.body?.tab, 50),
+ 
+            tokenClaims: {
+                admin:        decoded.admin === true,
+                isEnterprise: !!decoded.isEnterprise,
+                partner:      !!decoded.partner,
+                banned:       decoded.banned === true,
+            },
+            signInProvider: str(decoded.firebase?.sign_in_provider, 50),
+            tokenIssuedAt:  decoded.iat ? new Date(decoded.iat * 1000) : null,
+            tokenAuthTime:  decoded.auth_time ? new Date(decoded.auth_time * 1000) : null,
+ 
+            actionTaken,
+            actionError,
+            detectedAt: new Date(now),
+        });
+        incidentId = String(incident._id);
+    } catch (err) {
+        console.error(esProduccion ? "SECURITY_INCIDENT save failed 🔴" : `SECURITY_INCIDENT save failed 🔴 ${err}`);
+    }
+ 
+    // Queda también en tu auditoría general
+    try {
+        await Audit.create({
+            uid:       decoded.uid,
+            email:     decoded.email,
+            event:     "security-threat",
+            ip:        getClientIp(req),
+            userAgent: req.headers["user-agent"],
+            metadata:  { reason: "unauthorized-admin-access", incidentId, actionTaken },
+        });
+    } catch (err) {
+        console.error(esProduccion ? "Audit security-threat failed 🔴" : `Audit security-threat failed 🔴 ${err}`);
+    }
+ 
+    console.warn(`🚨 SECURITY_THREAT // unauthorized admin access uid=${decoded.uid} email=${decoded.email} ip=${getClientIp(req)} action=${actionTaken}`);
+ 
+    // ── Cerrar la sesión en el navegador ─────────────────────────────────────
+    res.clearCookie("idToken", esProduccion
+        ? { httpOnly: true, sameSite: "lax", secure: true, domain: ".hidden-security.org", path: "/" }
+        : { httpOnly: true, sameSite: "none", secure: true, path: "/" }
+    );
+ 
+    return res.status(403).json({
+        code:    "SECURITY_THREAT",
+        message: "Unauthorized admin access attempt detected.",
+        incidentId,
+    });
+});
+
 
 module.exports = authRouter
