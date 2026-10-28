@@ -33,89 +33,89 @@ async function sendVerificationEmail(email) {
     });
  
     const html = `
-<!DOCTYPE html>
-<html lang="es" xmlns="http://www.w3.org/1999/xhtml">
-<head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Verificá tu cuenta — Hidden Security</title>
-    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700;900&display=swap" rel="stylesheet">
-    <style>* { box-sizing:border-box; margin:0; padding:0; } body { background-color:#111111; font-family:'Montserrat',Arial,sans-serif; }</style>
-</head>
-<body style="margin:0; padding:0; background-color:#111111;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#111111; padding:40px 16px;">
-    <tr><td align="center">
-    <table role="presentation" width="600" cellpadding="0" cellspacing="0"
-        style="max-width:600px; width:100%; background-color:#000000; border:1px solid #ccff00;">
- 
-        <tr>
-            <td style="background-color:#ccff00; padding:28px 40px 24px;">
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
-                <td style="vertical-align:bottom;">
-                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:4px; text-transform:uppercase; color:rgba(0,0,0,0.45); margin:0 0 6px;">// HIDDEN_SECURITY</p>
-                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:28px; font-weight:900; letter-spacing:-1.5px; text-transform:uppercase; color:#000000; line-height:1; margin:0;">HIDDEN<span style="font-weight:400;">SECURITY</span></p>
-                </td>
-                <td style="text-align:right; vertical-align:bottom;">
-                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(0,0,0,0.5); margin:0;">VERIFICACIÓN<br/>DE CUENTA</p>
-                </td>
-            </tr></table>
-            </td>
-        </tr>
- 
-        <tr><td style="background-color:#000000; padding:44px 40px 40px;">
- 
-            <table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
-                <tr><td>
-                <span style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:3px; text-transform:uppercase; color:#ccff00; border:1px solid rgba(204,255,0,0.35); padding:5px 14px; background:rgba(204,255,0,0.06); display:inline-block;">⚡ ACTIVACIÓN_REQUERIDA</span>
-                </td></tr>
-            </table>
- 
-            <p style="font-family:'Montserrat',Arial,sans-serif; font-size:32px; font-weight:900; letter-spacing:-2px; text-transform:uppercase; color:#ffffff; line-height:1.05; margin:0 0 18px;">
-                CONFIRMÁ<br/><span style="color:#ccff00; font-weight:400;">TU CUENTA.</span>
-            </p>
- 
-            <p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; color:rgba(255,255,255,0.55); line-height:1.85; margin:0 0 36px;">
-                Hacé click en el botón de abajo para activar tu cuenta y acceder a la plataforma Hidden Security. Este link es válido por 24 horas.
-            </p>
- 
-            <table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:36px;">
+        <!DOCTYPE html>
+        <html lang="es" xmlns="http://www.w3.org/1999/xhtml">
+        <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <title>Verificá tu cuenta — Hidden Security</title>
+            <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700;900&display=swap" rel="stylesheet">
+            <style>* { box-sizing:border-box; margin:0; padding:0; } body { background-color:#111111; font-family:'Montserrat',Arial,sans-serif; }</style>
+        </head>
+        <body style="margin:0; padding:0; background-color:#111111;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#111111; padding:40px 16px;">
+            <tr><td align="center">
+            <table role="presentation" width="600" cellpadding="0" cellspacing="0"
+                style="max-width:600px; width:100%; background-color:#000000; border:1px solid #ccff00;">
+        
                 <tr>
-                    <td style="background-color:#ccff00;">
-                        <a href="${link}" style="display:block; padding:18px 40px; font-family:'Montserrat',Arial,sans-serif; font-size:11px; font-weight:900; letter-spacing:3px; text-transform:uppercase; color:#000000; text-decoration:none; white-space:nowrap;">
-                            VERIFICAR EMAIL →
-                        </a>
+                    <td style="background-color:#ccff00; padding:28px 40px 24px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+                        <td style="vertical-align:bottom;">
+                            <p style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:4px; text-transform:uppercase; color:rgba(0,0,0,0.45); margin:0 0 6px;">// HIDDEN_SECURITY</p>
+                            <p style="font-family:'Montserrat',Arial,sans-serif; font-size:28px; font-weight:900; letter-spacing:-1.5px; text-transform:uppercase; color:#000000; line-height:1; margin:0;">HIDDEN<span style="font-weight:400;">SECURITY</span></p>
+                        </td>
+                        <td style="text-align:right; vertical-align:bottom;">
+                            <p style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(0,0,0,0.5); margin:0;">VERIFICACIÓN<br/>DE CUENTA</p>
+                        </td>
+                    </tr></table>
                     </td>
                 </tr>
+        
+                <tr><td style="background-color:#000000; padding:44px 40px 40px;">
+        
+                    <table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+                        <tr><td>
+                        <span style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:3px; text-transform:uppercase; color:#ccff00; border:1px solid rgba(204,255,0,0.35); padding:5px 14px; background:rgba(204,255,0,0.06); display:inline-block;">⚡ ACTIVACIÓN_REQUERIDA</span>
+                        </td></tr>
+                    </table>
+        
+                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:32px; font-weight:900; letter-spacing:-2px; text-transform:uppercase; color:#ffffff; line-height:1.05; margin:0 0 18px;">
+                        CONFIRMÁ<br/><span style="color:#ccff00; font-weight:400;">TU CUENTA.</span>
+                    </p>
+        
+                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; color:rgba(255,255,255,0.55); line-height:1.85; margin:0 0 36px;">
+                        Hacé click en el botón de abajo para activar tu cuenta y acceder a la plataforma Hidden Security. Este link es válido por 24 horas.
+                    </p>
+        
+                    <table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:36px;">
+                        <tr>
+                            <td style="background-color:#ccff00;">
+                                <a href="${link}" style="display:block; padding:18px 40px; font-family:'Montserrat',Arial,sans-serif; font-size:11px; font-weight:900; letter-spacing:3px; text-transform:uppercase; color:#000000; text-decoration:none; white-space:nowrap;">
+                                    VERIFICAR EMAIL →
+                                </a>
+                            </td>
+                        </tr>
+                    </table>
+        
+                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:8px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(255,255,255,0.2); margin:0 0 8px;">// Si el botón no funciona, copiá este link:</p>
+                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:10px; color:rgba(255,255,255,0.25); word-break:break-all; line-height:1.6; margin:0;">${link}</p>
+        
+                </td></tr>
+        
+                <tr>
+                    <td style="background-color:#0a0a0a; border-top:1px solid rgba(204,255,0,0.15); padding:24px 40px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+                        <td><p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; font-weight:700; letter-spacing:3px; text-transform:uppercase; color:#ccff00; margin:0 0 4px;">HIDDEN_SECURITY</p>
+                        <p style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; letter-spacing:2px; text-transform:uppercase; color:rgba(255,255,255,0.2); margin:0;">// CYBERSECURITY_TRAINING</p></td>
+                        <td style="text-align:right;"><p style="font-family:'Montserrat',Arial,sans-serif; font-size:10px; color:rgba(255,255,255,0.2); margin:0; line-height:1.7;">Mensaje automático.<br/>No respondas a esta dirección.</p></td>
+                    </tr></table>
+                    </td>
+                </tr>
+                <tr>
+                    <td style="background-color:#ccff00; padding:11px 40px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+                        <td><p style="font-family:'Montserrat',Arial,sans-serif; font-size:8px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(0,0,0,0.5); margin:0;">© ${new Date().getFullYear()} HIDDEN SECURITY · TODOS LOS DERECHOS RESERVADOS</p></td>
+                        <td style="text-align:right;"><p style="font-family:'Montserrat',Arial,sans-serif; font-size:8px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(0,0,0,0.5); margin:0;">ARGENTINA</p></td>
+                    </tr></table>
+                    </td>
+                </tr>
+        
             </table>
- 
-            <p style="font-family:'Montserrat',Arial,sans-serif; font-size:8px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(255,255,255,0.2); margin:0 0 8px;">// Si el botón no funciona, copiá este link:</p>
-            <p style="font-family:'Montserrat',Arial,sans-serif; font-size:10px; color:rgba(255,255,255,0.25); word-break:break-all; line-height:1.6; margin:0;">${link}</p>
- 
-        </td></tr>
- 
-        <tr>
-            <td style="background-color:#0a0a0a; border-top:1px solid rgba(204,255,0,0.15); padding:24px 40px;">
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
-                <td><p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; font-weight:700; letter-spacing:3px; text-transform:uppercase; color:#ccff00; margin:0 0 4px;">HIDDEN_SECURITY</p>
-                <p style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; letter-spacing:2px; text-transform:uppercase; color:rgba(255,255,255,0.2); margin:0;">// CYBERSECURITY_TRAINING</p></td>
-                <td style="text-align:right;"><p style="font-family:'Montserrat',Arial,sans-serif; font-size:10px; color:rgba(255,255,255,0.2); margin:0; line-height:1.7;">Mensaje automático.<br/>No respondas a esta dirección.</p></td>
-            </tr></table>
-            </td>
-        </tr>
-        <tr>
-            <td style="background-color:#ccff00; padding:11px 40px;">
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
-                <td><p style="font-family:'Montserrat',Arial,sans-serif; font-size:8px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(0,0,0,0.5); margin:0;">© ${new Date().getFullYear()} HIDDEN SECURITY · TODOS LOS DERECHOS RESERVADOS</p></td>
-                <td style="text-align:right;"><p style="font-family:'Montserrat',Arial,sans-serif; font-size:8px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(0,0,0,0.5); margin:0;">ARGENTINA</p></td>
-            </tr></table>
-            </td>
-        </tr>
- 
-    </table>
-    </td></tr>
-</table>
-</body></html>`;
- 
+            </td></tr>
+        </table>
+        </body></html>`;
+        
     await brevo.transactionalEmails.sendTransacEmail({
         sender:      { email: process.env.EMAIL_FROM, name: "Hidden Security" },
         to:          [{ email }],
@@ -124,6 +124,104 @@ async function sendVerificationEmail(email) {
     });
  
     console.log(`✅ Email de verificación enviado a ${email}`);
+}
+
+async function sendPasswordResetEmailBrevo(email) {
+    const frontendUrl = process.env.FRONT_END || process.env.LOCAL_HOST || "http://localhost:5173";
+ 
+    // Admin SDK genera el link: el frontend ya no necesita el SDK cliente ni la API key
+    const link = await auth.generatePasswordResetLink(email, { url: `${frontendUrl}/` });
+ 
+    const html = `
+        <!DOCTYPE html>
+        <html lang="es" xmlns="http://www.w3.org/1999/xhtml">
+        <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <title>Restablecé tu contraseña — Hidden Security</title>
+            <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700;900&display=swap" rel="stylesheet">
+            <style>* { box-sizing:border-box; margin:0; padding:0; } body { background-color:#111111; font-family:'Montserrat',Arial,sans-serif; }</style>
+        </head>
+        <body style="margin:0; padding:0; background-color:#111111;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#111111; padding:40px 16px;">
+            <tr><td align="center">
+            <table role="presentation" width="600" cellpadding="0" cellspacing="0"
+                style="max-width:600px; width:100%; background-color:#000000; border:1px solid #ccff00;">
+        
+                <tr>
+                    <td style="background-color:#ccff00; padding:28px 40px 24px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+                        <td style="vertical-align:bottom;">
+                            <p style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:4px; text-transform:uppercase; color:rgba(0,0,0,0.45); margin:0 0 6px;">// HIDDEN_SECURITY</p>
+                            <p style="font-family:'Montserrat',Arial,sans-serif; font-size:28px; font-weight:900; letter-spacing:-1.5px; text-transform:uppercase; color:#000000; line-height:1; margin:0;">HIDDEN<span style="font-weight:400;">SECURITY</span></p>
+                        </td>
+                        <td style="text-align:right; vertical-align:bottom;">
+                            <p style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(0,0,0,0.5); margin:0;">RESTABLECER<br/>CONTRASEÑA</p>
+                        </td>
+                    </tr></table>
+                    </td>
+                </tr>
+        
+                <tr><td style="background-color:#000000; padding:44px 40px 40px;">
+        
+                    <table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+                        <tr><td>
+                        <span style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; font-weight:700; letter-spacing:3px; text-transform:uppercase; color:#ccff00; border:1px solid rgba(204,255,0,0.35); padding:5px 14px; background:rgba(204,255,0,0.06); display:inline-block;">⚡ SOLICITUD_DE_CAMBIO</span>
+                        </td></tr>
+                    </table>
+        
+                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:32px; font-weight:900; letter-spacing:-2px; text-transform:uppercase; color:#ffffff; line-height:1.05; margin:0 0 18px;">
+                        NUEVA<br/><span style="color:#ccff00; font-weight:400;">CONTRASEÑA.</span>
+                    </p>
+        
+                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; color:rgba(255,255,255,0.55); line-height:1.85; margin:0 0 36px;">
+                        Recibimos un pedido para restablecer la contraseña de tu cuenta. Hacé click en el botón de abajo para elegir una nueva. Si no fuiste vos, ignorá este mensaje: tu contraseña actual sigue funcionando.
+                    </p>
+        
+                    <table role="presentation" cellpadding="0" cellspacing="0" style="margin-bottom:36px;">
+                        <tr>
+                            <td style="background-color:#ccff00;">
+                                <a href="${link}" style="display:block; padding:18px 40px; font-family:'Montserrat',Arial,sans-serif; font-size:11px; font-weight:900; letter-spacing:3px; text-transform:uppercase; color:#000000; text-decoration:none; white-space:nowrap;">
+                                    CAMBIAR CONTRASEÑA →
+                                </a>
+                            </td>
+                        </tr>
+                    </table>
+        
+                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:8px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(255,255,255,0.2); margin:0 0 8px;">// Si el botón no funciona, copiá este link:</p>
+                    <p style="font-family:'Montserrat',Arial,sans-serif; font-size:10px; color:rgba(255,255,255,0.25); word-break:break-all; line-height:1.6; margin:0;">${link}</p>
+        
+                </td></tr>
+        
+                <tr>
+                    <td style="background-color:#0a0a0a; border-top:1px solid rgba(204,255,0,0.15); padding:24px 40px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+                        <td><p style="font-family:'Montserrat',Arial,sans-serif; font-size:13px; font-weight:700; letter-spacing:3px; text-transform:uppercase; color:#ccff00; margin:0 0 4px;">HIDDEN_SECURITY</p>
+                        <p style="font-family:'Montserrat',Arial,sans-serif; font-size:9px; letter-spacing:2px; text-transform:uppercase; color:rgba(255,255,255,0.2); margin:0;">// CYBERSECURITY_TRAINING</p></td>
+                        <td style="text-align:right;"><p style="font-family:'Montserrat',Arial,sans-serif; font-size:10px; color:rgba(255,255,255,0.2); margin:0; line-height:1.7;">Mensaje automático.<br/>No respondas a esta dirección.</p></td>
+                    </tr></table>
+                    </td>
+                </tr>
+                <tr>
+                    <td style="background-color:#ccff00; padding:11px 40px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+                        <td><p style="font-family:'Montserrat',Arial,sans-serif; font-size:8px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(0,0,0,0.5); margin:0;">© ${new Date().getFullYear()} HIDDEN SECURITY · TODOS LOS DERECHOS RESERVADOS</p></td>
+                        <td style="text-align:right;"><p style="font-family:'Montserrat',Arial,sans-serif; font-size:8px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:rgba(0,0,0,0.5); margin:0;">ARGENTINA</p></td>
+                    </tr></table>
+                    </td>
+                </tr>
+        
+            </table>
+            </td></tr>
+        </table>
+        </body></html>`;
+ 
+    await brevo.transactionalEmails.sendTransacEmail({
+        sender:      { email: process.env.EMAIL_FROM, name: "Hidden Security" },
+        to:          [{ email }],
+        subject:     "Restablecé tu contraseña — Hidden Security",
+        htmlContent: html,
+    });
 }
 
 // ─── Helper: verificar si un email existe en Firebase ─────────────────────────
@@ -732,5 +830,32 @@ authRouter.post("/admin/verify-access", verifyToken, async (req, res) => {
     });
 });
 
+authRouter.post("/reset-password", loginLimiter, async (req, res) => {
+    const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+ 
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+        return res.status(400).json({ code: "auth/invalid-email", message: "Invalid email" });
+    }
+ 
+    const genericOk = { message: "Si el email está registrado, vas a recibir un link para restablecer la contraseña. 🟢" };
+ 
+    try {
+        const userRecord = await auth.getUserByEmail(email);
+ 
+        // Baneados y cuentas deshabilitadas no reciben link (respuesta igual)
+        if (userRecord.disabled || userRecord.customClaims?.banned === true) {
+            return res.status(200).json(genericOk);
+        }
+ 
+        await sendPasswordResetEmailBrevo(email);
+        return res.status(200).json(genericOk);
+    } catch (error) {
+        if (error?.code === "auth/user-not-found") {
+            return res.status(200).json(genericOk);
+        }
+        console.error(esProduccion ? "Error sending password reset 🔴" : `Error sending password reset 🔴 ${error}`);
+        return res.status(500).json({ message: "Error sending email" });
+    }
+});
 
 module.exports = authRouter

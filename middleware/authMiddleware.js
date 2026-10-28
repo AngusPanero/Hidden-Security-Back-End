@@ -16,6 +16,23 @@ const verifyToken = async (req, res, next) => {
         // cambio de claims), el idToken viejo deja de servir al instante en vez
         // de seguir siendo válido hasta 1 hora.
         const decoded = await auth.verifyIdToken(token, true)
+
+        // Un token se puede conseguir directo contra Firebase (con la API key),
+        // sin pasar por /login. Por eso las mismas reglas del login se aplican
+        // acá, en cada pedido:
+
+        // 1) Baneado → afuera, aunque el token sea nuevo y válido
+        if (decoded.banned === true) {
+            return res.status(403).json({ code: "USER_BANNED", message: "User is banned" })
+        }
+
+        // 2) Usuario normal con email sin verificar → afuera
+        //    (admin, enterprise y partner quedan exentos, igual que en /login)
+        const isPrivileged = decoded.admin === true || !!decoded.isEnterprise || !!decoded.partner
+        if (!isPrivileged && decoded.email_verified !== true) {
+            return res.status(403).json({ code: "auth/email-not-verified", message: "Email not verified" })
+        }
+
         req.user = decoded // Le doy al user las custom claims verificadas
 
         next()
