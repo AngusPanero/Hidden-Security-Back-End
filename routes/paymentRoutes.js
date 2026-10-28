@@ -12,6 +12,12 @@ const auth            = require("../config/firebase")
 
 const { notifyNewSale }        = require("../sseManager/sseManajer")
 const { refreshSessionCookie } = require("../utils/refreshsessioncookie")
+const { verifyPin }  = require("../utils/signPin");
+const AdminSignGuard = require("../models/AdminSignGuard");
+
+// TOKEN
+const MAX_FAILED_ATTEMPTS = 5;
+const LOCK_MINUTES        = 15;
 
 // ─── Mercado Pago SDK ────────────────────────────────────────────────────────
 const { MercadoPagoConfig, Payment } = require("mercadopago")
@@ -88,7 +94,6 @@ const VISIBLE_STATUSES = ['approved', ...PENDING_STATUSES];
 const ORDER_IN_FLIGHT_MS   = 15 * 60 * 1000;
 // Tiempo tras el cual una activación 'processing' se considera colgada y se reintenta
 const FULFILLMENT_STALE_MS = 2 * 60 * 1000;
-
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  HELPERS
@@ -439,7 +444,57 @@ paymentsRouter.get("/tickets", verifyToken, async (req, res) => {
     }
 });
 
-paymentsRouter.get("/all-tickets", adminMiddleware, async (req, res) => {
+async function checkSignPin(req, res) {
+    const adminUid = req.user?.uid;
+    if (!adminUid) { res.status(401).json({ message: "No autorizado 🔴" }); return false; }
+
+    try {
+        const guard = await AdminSignGuard.findOne({ adminUid }).lean();
+        if (guard?.lockedUntil && guard.lockedUntil > new Date()) {
+            const hora = guard.lockedUntil.toLocaleTimeString("es-AR", { timeZone: "America/Argentina/Buenos_Aires", hour: "2-digit", minute: "2-digit" });
+            res.status(429).json({ message: `Demasiados intentos fallidos. Reintentá después de las ${hora} 🔴`, code: "CLAVE_BLOQUEADA" });
+            return false;
+        }
+
+        let pinOk = false;
+        try {
+            const { pin } = req.body || {};
+            pinOk = await verifyPin(typeof pin === "string" ? pin : "");
+        } catch (err) {
+            console.error(esProduccion ? "ERROR_SIGN_PIN_CONFIG" : `ERROR_SIGN_PIN_CONFIG: ${err.message}`);
+            res.status(500).json({ message: "Clave de firma no configurada en el servidor 🔴", code: "CLAVE_NO_CONFIGURADA" });
+            return false;
+        }
+
+        if (!pinOk) {
+            const g = await AdminSignGuard.findOneAndUpdate(
+                { adminUid },
+                { $inc: { failedCount: 1 }, $set: { lastFailedAt: new Date() } },
+                { upsert: true, new: true }
+            );
+            if (g.failedCount >= MAX_FAILED_ATTEMPTS) {
+                await AdminSignGuard.updateOne({ adminUid }, { $set: { lockedUntil: new Date(Date.now() + LOCK_MINUTES * 60000), failedCount: 0 } });
+                res.status(429).json({ message: `Clave incorrecta. Bloqueado por ${LOCK_MINUTES} minutos 🔴`, code: "CLAVE_BLOQUEADA" });
+            } else {
+                const remaining = MAX_FAILED_ATTEMPTS - g.failedCount;
+                res.status(401).json({ message: `Clave de firma incorrecta. Te quedan ${remaining} intento(s) 🔴`, code: "CLAVE_INCORRECTA", remaining });
+            }
+            return false;
+        }
+
+        await AdminSignGuard.updateOne({ adminUid }, { $set: { failedCount: 0, lockedUntil: null } });
+        delete req.body.pin;
+        return true;
+    } catch (err) {
+        console.error(esProduccion ? "ERROR_SIGN_PIN" : `ERROR_SIGN_PIN: ${err}`);
+        res.status(500).json({ message: "Error interno al verificar la clave 🔴" });
+        return false;
+    }
+}
+
+paymentsRouter.post("/all-tickets", adminMiddleware, async (req, res) => {
+    if (!(await checkSignPin(req, res))) return;
+
     try {
         const allPayments = await PaymentsMongo
             .find({})
@@ -447,6 +502,9 @@ paymentsRouter.get("/all-tickets", adminMiddleware, async (req, res) => {
             .limit(5000)
             .select('-__v')
             .lean();
+
+        // Datos financieros: que ningún navegador/proxy los cachee
+        res.set('Cache-Control', 'no-store');
 
         // Lista vacía = 200 con [], no 404 (no es un error)
         return res.status(200).json(allPayments.map(withFinancing));
