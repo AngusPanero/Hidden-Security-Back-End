@@ -1,5 +1,6 @@
 const express = require("express");
 const mongoose = require("mongoose");
+const crypto = require("crypto");
 const cvRouter = express.Router();
 const { CV } = require("../models/cvModel");
 const { Vacancy } = require("../models/vacancyModel");
@@ -26,6 +27,40 @@ function sanitizeDeep(obj) {
     return out;
   }
   return sanitizeString(obj);
+}
+
+// ─── Cloudinary: foto del CV con subida firmada ───────────────────────────────
+// Cada usuario tiene UN solo lugar para su foto (cv-photos/<uid>): cada subida
+// pisa la anterior, así nadie puede llenar la cuenta de archivos.
+const CLOUDINARY_PRESET          = "product-images";
+const CLOUDINARY_CV_FOLDER       = "cv-photos";
+const CLOUDINARY_ALLOWED_FORMATS = "jpg,jpeg,png,webp"; // sin svg ni html/raw
+const PHOTO_URL_MAX              = 500;
+
+// Firma oficial de Cloudinary: params ordenados, key=value con &, + secret, SHA-1
+function signCloudinaryParams(params, apiSecret) {
+  const toSign = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join("&");
+  return crypto.createHash("sha1").update(toSign + apiSecret).digest("hex");
+}
+
+// La foto solo puede ser una imagen de NUESTRA cuenta de Cloudinary, dentro de
+// la carpeta del propio usuario. Evita URLs externas (tracking de quien abre el
+// CV) y que alguien use la foto de otro.
+function isValidCvPhotoUrl(value, uid) {
+  if (value === "" || value === null || value === undefined) return true;
+  if (typeof value !== "string" || value.length > PHOTO_URL_MAX) return false;
+  const cloud = process.env.CLOUDINARY_CLOUD_NAME;
+  if (!cloud) return false;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.hostname !== "res.cloudinary.com") return false;
+    if (/["'<>\s]/.test(value)) return false;
+    const prefix = `/${cloud}/image/upload/`;
+    if (!url.pathname.startsWith(prefix)) return false;
+    return url.pathname.includes(`/${CLOUDINARY_CV_FOLDER}/${uid}.`);
+  } catch {
+    return false;
+  }
 }
 
 // Estructura vacía por defecto para skills (evita undefined en clientes viejos)
@@ -286,6 +321,16 @@ cvRouter.put("/api/cv/me", verifyToken, async (req, res) => {
     // Sanitizar todo el contenido antes de guardar — elimina HTML/scripts
     // sanitizeDeep es recursivo, así que soporta el objeto anidado
     // { roles: [], habilidades: [], herramientas: [] } sin cambios.
+    // La foto tiene que ser la del propio usuario en nuestro Cloudinary.
+    // Excepción: si es la misma que ya tenía guardada (fotos subidas antes de
+    // este cambio), se acepta para no obligar a nadie a re-subirla.
+    if (personalInfo?.photo !== undefined && !isValidCvPhotoUrl(personalInfo.photo, req.user.uid)) {
+      const current = await CV.findOne({ userId: req.user.uid }).select("personalInfo.photo").lean();
+      if (!current || current.personalInfo?.photo !== personalInfo.photo) {
+        return res.status(400).json({ message: "Foto inválida. Subila de nuevo desde el CV." });
+      }
+    }
+
     const update = {};
     if (personalInfo    !== undefined) update.personalInfo    = sanitizeDeep(personalInfo);
     if (experience      !== undefined) update.experience      = sanitizeDeep(experience);
@@ -312,6 +357,38 @@ cvRouter.put("/api/cv/me", verifyToken, async (req, res) => {
     console.error(esProduccion ? "Error PUT /cv/me" : `Error PUT /cv/me: ${err}`);
     res.status(500).json({ message: "Error al guardar el CV" });
   }
+});
+
+// ─── POST /api/cv/photo-signature ─────────────────────────────────────────────
+// Firma para subir la foto del CV. Solo usuarios logueados (verifyToken ya
+// exige email verificado y no baneado). La firma vale ~1 hora y solo sirve
+// para la carpeta del propio usuario y formatos de imagen.
+cvRouter.post("/api/cv/photo-signature", verifyToken, async (req, res) => {
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+  const apiKey    = process.env.CLOUDINARY_API_KEY;
+  const apiSecret = process.env.CLOUDINARY_API_SECRET;
+
+  if (!cloudName || !apiKey || !apiSecret) {
+    console.error("❌ Faltan CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET");
+    return res.status(500).json({ message: "Subida de fotos no disponible" });
+  }
+
+  const params = {
+    allowed_formats: CLOUDINARY_ALLOWED_FORMATS,
+    invalidate:      "true",                                  // limpia la caché al reemplazar
+    overwrite:       "true",                                  // pisa la foto anterior
+    public_id:       `${CLOUDINARY_CV_FOLDER}/${req.user.uid}`,
+    timestamp:       Math.floor(Date.now() / 1000),
+    upload_preset:   CLOUDINARY_PRESET,
+  };
+
+  res.set("Cache-Control", "no-store");
+  return res.json({
+    cloudName,
+    apiKey,                                                   // pública; el secret NO sale
+    signature: signCloudinaryParams(params, apiSecret),
+    ...params,
+  });
 });
 
 // ─── DELETE /api/cv/me ────────────────────────────────────────────────────────

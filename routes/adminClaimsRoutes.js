@@ -1,7 +1,9 @@
 const express = require("express");
+const crypto  = require("crypto");
 const adminClaimsRouter = express.Router();
 
 const auth             = require("../config/firebase");
+const Audit            = require("../models/AuditSchema");
 const adminMiddleware  = require("../middleware/adminMiddleware");
 const AdminSignGuard   = require("../models/AdminSignGuard");
 const AdminClaimsAudit = require("../models/AdminClaimsAudit");
@@ -24,7 +26,18 @@ const VALID_ACTIONS = [
     "make_partner",      // 3) partner: true
     "clear_all",         // 4) reset total de claims
     "clear_purchases",   // 5) solo compras
+    "ban_user",          // 6) banear (conserva el resto de las claims)
+    "unban_user",        // 7) desbanear (conserva el resto de las claims)
 ];
+
+const BAN_REASON_MAX = 200;
+
+// ─── Cloudinary: subidas firmadas ─────────────────────────────────────────────
+// El preset "product-images" pasa a ser Signed: nadie puede subir sin una firma
+// generada acá con el API secret (que nunca sale del servidor).
+const CLOUDINARY_PRESET          = "product-images";
+const CLOUDINARY_FOLDER          = "company-logos";
+const CLOUDINARY_ALLOWED_FORMATS = "jpg,jpeg,png,webp"; // sin svg (puede llevar scripts) ni html/raw
 
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCK_MINUTES        = 15;
@@ -66,10 +79,14 @@ function sanitizeClaimsForResponse(claims) {
         enterprisePlanExpiry:  c.enterprisePlanExpiry ?? null,
         vacancyLimit:          c.vacancyLimit ?? null,
         vacanciesUsed:         c.vacanciesUsed ?? 0,
+        banned:                c.banned === true,
+        bannedAt:              c.bannedAt ?? null,
+        bannedReason:          c.bannedReason ?? null,
         otherClaims:           Object.keys(c).filter(k => ![
             "admin", "isAdmin", "isEnterprise", "partner", "companyName", "companyLogo",
             "purchases", "purchaseExpiry", "enterprisePlan", "enterprisePlanExpiry",
             "enterprisePurchasedAt", "vacancyLimit", "vacanciesUsed",
+            "banned", "bannedAt", "bannedReason",
         ].includes(k)),
     };
 }
@@ -80,6 +97,24 @@ function validateCompanyName(value) {
     if (name.length < 2 || name.length > COMPANY_NAME_MAX) return null;
     if (/[<>]/.test(name)) return null;
     return name;
+}
+
+function validateBanReason(value) {
+    if (value === null || value === undefined) return "";
+    if (typeof value !== "string") return null;
+    const reason = value.trim();
+    if (reason.length > BAN_REASON_MAX || /[<>]/.test(reason)) return null;
+    return reason;
+}
+
+// Firma de Cloudinary: params ordenados alfabéticamente, key=value unidos con &,
+// + API secret, en SHA-1 (formato oficial de Cloudinary para subidas firmadas).
+function signCloudinaryParams(params, apiSecret) {
+    const toSign = Object.keys(params)
+        .sort()
+        .map(k => `${k}=${params[k]}`)
+        .join("&");
+    return crypto.createHash("sha1").update(toSign + apiSecret).digest("hex");
 }
 
 function validateLogoUrl(value) {
@@ -338,6 +373,41 @@ adminClaimsRouter.post("/admin/claims/:uid", adminMiddleware, requireFreshAdmin,
             for (const key of PURCHASE_CLAIMS) delete newClaims[key];
             break;
         }
+
+        // ── 6) Banear ─────────────────────────────────────────────────────────
+        // Merge: solo agrega los datos del ban, no toca compras ni roles.
+        case "ban_user": {
+            const reason = validateBanReason(req.body.reason);
+            auditPayload = { reason };
+
+            if (reason === null) {
+                return reject(400, "MOTIVO_INVÁLIDO", `Hasta ${BAN_REASON_MAX} caracteres, sin < ni >.`);
+            }
+            if (currentClaims.banned === true) {
+                return reject(409, "YA_ESTÁ_BANEADO", "Este usuario ya está baneado.");
+            }
+
+            newClaims = {
+                ...currentClaims,
+                banned:       true,
+                bannedAt:     Date.now(),
+                bannedReason: reason ? `Banned by admin: ${reason}` : "Banned directly by admin.",
+            };
+            revokeSessions = true;
+            break;
+        }
+
+        // ── 7) Desbanear ──────────────────────────────────────────────────────
+        // Quita solo los datos del ban y conserva el resto de las claims.
+        case "unban_user": {
+            if (currentClaims.banned !== true) {
+                return reject(409, "NO_ESTÁ_BANEADO", "Este usuario no está baneado.");
+            }
+            const { banned, bannedAt, bannedReason, ...rest } = currentClaims;
+            newClaims = { ...rest, banned: false };
+            revokeSessions = true;
+            break;
+        }
     }
 
     // ── 5. Límite de tamaño de Firebase ───────────────────────────────────────
@@ -349,6 +419,28 @@ adminClaimsRouter.post("/admin/claims/:uid", adminMiddleware, requireFreshAdmin,
     try {
         await auth.setCustomUserClaims(targetUid, newClaims);
         if (revokeSessions) await auth.revokeRefreshTokens(targetUid);
+
+        // Al desbanear: resetear intentos fallidos de login y dejar constancia
+        if (action === "unban_user") {
+            try {
+                await Audit.findOneAndUpdate(
+                    { uid: targetUid, event: "login-failed" },
+                    { $set: { attempts: 0, lastAttemptAt: null } }
+                );
+                await Audit.findOneAndUpdate(
+                    { email: target.email, event: "login-failed" },
+                    { $set: { attempts: 0, lastAttemptAt: null } }
+                );
+                await Audit.create({
+                    uid:      targetUid,
+                    email:    target.email,
+                    event:    "forced_logout",
+                    metadata: { action: "unban", by: req.freshAdmin.email || req.freshAdmin.uid },
+                });
+            } catch (auditErr) {
+                console.error("⚠️ [adminClaims] Audit unban:", auditErr.message);
+            }
+        }
 
         const updated = await auth.getUser(targetUid);
 
@@ -365,6 +457,38 @@ adminClaimsRouter.post("/admin/claims/:uid", adminMiddleware, requireFreshAdmin,
         console.error("❌ [adminClaims] setCustomUserClaims:", err.message);
         return res.status(500).json({ message: "ERROR_APLICANDO_CLAIMS" });
     }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  POST /admin/upload-signature — firma para subir UNA imagen a Cloudinary
+//  Solo admins (re-chequeados en vivo). La firma vale ~1 hora y solo para estos
+//  parámetros exactos: preset, carpeta y formatos de imagen permitidos.
+// ═══════════════════════════════════════════════════════════════════════════════
+adminClaimsRouter.post("/admin/upload-signature", adminMiddleware, requireFreshAdmin, async (req, res) => {
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+    const apiKey    = process.env.CLOUDINARY_API_KEY;
+    const apiSecret = process.env.CLOUDINARY_API_SECRET;
+
+    if (!cloudName || !apiKey || !apiSecret) {
+        console.error("❌ [adminClaims] Faltan CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET");
+        return res.status(500).json({ message: "CLOUDINARY_NO_CONFIGURADO" });
+    }
+
+    const params = {
+        allowed_formats: CLOUDINARY_ALLOWED_FORMATS,
+        folder:          CLOUDINARY_FOLDER,
+        timestamp:       Math.floor(Date.now() / 1000),
+        upload_preset:   CLOUDINARY_PRESET,
+    };
+
+    await audit(req, { targetUid: "-", action: "upload_signature", result: "success" });
+
+    return res.json({
+        cloudName,
+        apiKey,                                   // la API key es pública; el secret NO sale
+        signature: signCloudinaryParams(params, apiSecret),
+        ...params,
+    });
 });
 
 module.exports = adminClaimsRouter;
