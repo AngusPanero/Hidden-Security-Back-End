@@ -57,3 +57,4 @@ certifySocCertif.js
 setPlanExpiry.js
 listClaims.js
 createTestCertificate.js
+addCompletedCourse.js

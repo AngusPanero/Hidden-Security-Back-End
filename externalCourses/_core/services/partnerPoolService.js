@@ -1,0 +1,857 @@
+const mongoose = require("mongoose");
+
+const Partner = require("../schemas/PartnerSchema");
+const CourseVersion = require("../schemas/CourseVersionSchema");
+const CourseProgressEvent = require("../schemas/CourseProgressEventSchema");
+const PartnerPoolConfig = require("../schemas/PartnerPoolConfigSchema");
+const PartnerPoolConsumption = require("../schemas/PartnerPoolConsumptionSchema");
+const PartnerPoolPeriod = require("../schemas/PartnerPoolPeriodSchema");
+const PartnerPoolSettlement = require("../schemas/PartnerPoolSettlementSchema");
+const PartnerPoolAuditLog = require("../schemas/PartnerPoolAuditLogSchema");
+const { EVENT_TYPES } = require("../constants/eventTypes");
+const { ACCESS_TYPES } = require("../constants/accessTypes");
+const { httpError } = require("../utils/httpError");
+const { runInTransaction } = require("../utils/db");
+const { computeRevenue } = require("./partnerPoolRevenue");
+
+// ══════════════════════════════════════════════════════════════════════
+//  Partner Pool V1 — cálculo mensual, liquidaciones, ajustes y auditoría
+//  (Especificación funcional y técnica V1, secciones 16 a 26)
+// ══════════════════════════════════════════════════════════════════════
+
+const Decimal128 = mongoose.Types.Decimal128;
+const EXCLUDED_ACCESS = new Set([ACCESS_TYPES.ADMIN, ACCESS_TYPES.TEST]);
+
+// ─── Números ─────────────────────────────────────────────────────────
+// Se calcula sin redondeos intermedios y se guarda en Decimal128.
+// El único redondeo monetario es el del monto final de cada liquidación.
+const SCORE_DIGITS = 12;
+const toDec = (n, digits = SCORE_DIGITS) => Decimal128.fromString(Number(n || 0).toFixed(digits));
+const toMoney = (n) => Decimal128.fromString((Math.round(Number(n || 0) * 100) / 100).toFixed(2));
+const num = (d) => (d == null ? null : Number(d.toString()));
+
+// Decimal128 → number en todo un objeto (para responder JSON legible)
+function plain(value) {
+    if (value == null) return value;
+    if (value instanceof Decimal128 || value._bsontype === "Decimal128") return Number(value.toString());
+    if (value instanceof mongoose.Types.ObjectId || value._bsontype === "ObjectId") return String(value);
+    if (value instanceof Date) return value.toISOString();
+    if (Array.isArray(value)) return value.map(plain);
+    if (typeof value === "object") {
+        const out = {};
+        for (const [k, v] of Object.entries(value)) out[k] = plain(v);
+        return out;
+    }
+    return value;
+}
+
+// ─── Período ─────────────────────────────────────────────────────────
+// Meses de Argentina (UTC-3, sin horario de verano):
+// "2026-10" = [2026-10-01 00:00 ART, 2026-11-01 00:00 ART)
+const PERIOD_RE = /^(\d{4})-(0[1-9]|1[0-2])$/;
+const AR_OFFSET_HOURS = 3;
+
+function parsePeriod(period) {
+    const m = PERIOD_RE.exec(String(period || ""));
+    if (!m) throw httpError(400, "Período inválido (formato AAAA-MM)");
+    const y = Number(m[1]);
+    const mo = Number(m[2]);
+    return {
+        period: `${m[1]}-${m[2]}`,
+        from: new Date(Date.UTC(y, mo - 1, 1, AR_OFFSET_HOURS)),
+        to: new Date(Date.UTC(y, mo, 1, AR_OFFSET_HOURS)),
+    };
+}
+
+// ─── Configuración ───────────────────────────────────────────────────
+async function getConfig() {
+    const existing = await PartnerPoolConfig.findOne({ key: "active" }).lean();
+    if (existing) return existing;
+    try {
+        return (await PartnerPoolConfig.create({ key: "active" })).toObject();
+    } catch {
+        return PartnerPoolConfig.findOne({ key: "active" }).lean(); // la creó otra request
+    }
+}
+
+const RATE_FIELDS = ["maximumPoolRate", "progressWeight", "completionWeight", "consumptionTargetRate"];
+
+async function updateConfig(changes, admin) {
+    const current = await getConfig();
+    const set = {};
+
+    for (const f of RATE_FIELDS) {
+        if (changes[f] === undefined) continue;
+        const v = Number(changes[f]);
+        if (!Number.isFinite(v) || v < 0 || v > 1) throw httpError(400, `${f} tiene que estar entre 0 y 1`);
+        set[f] = v;
+    }
+    if (changes.defaultCourseWeight !== undefined) {
+        const v = Number(changes.defaultCourseWeight);
+        if (!Number.isFinite(v) || v <= 0) throw httpError(400, "defaultCourseWeight tiene que ser mayor a 0");
+        set.defaultCourseWeight = v;
+    }
+    if (changes.revenue && typeof changes.revenue === "object") {
+        const r = changes.revenue;
+        if (r.includeEnterprisePayments !== undefined) set["revenue.includeEnterprisePayments"] = r.includeEnterprisePayments === true;
+        if (r.defaultMpFeeRate !== undefined) {
+            const v = Number(r.defaultMpFeeRate);
+            if (!Number.isFinite(v) || v < 0 || v >= 1) throw httpError(400, "defaultMpFeeRate inválido");
+            set["revenue.defaultMpFeeRate"] = v;
+        }
+        if (r.excludedItems !== undefined) {
+            if (!Array.isArray(r.excludedItems)) throw httpError(400, "excludedItems tiene que ser una lista");
+            set["revenue.excludedItems"] = r.excludedItems.map((i) => String(i).trim().toLowerCase()).filter(Boolean);
+        }
+    }
+
+    const progressW = set.progressWeight ?? current.progressWeight;
+    const completionW = set.completionWeight ?? current.completionWeight;
+    if (Math.abs(progressW + completionW - 1) > 1e-9) {
+        throw httpError(400, "progressWeight + completionWeight tiene que dar 1 (un recorrido completo = 1 punto)");
+    }
+    if (!Object.keys(set).length) throw httpError(400, "No hay cambios para guardar");
+
+    set.updatedBy = admin.uid;
+    const updated = await PartnerPoolConfig.findOneAndUpdate({ key: "active" }, { $set: set }, { returnDocument: "after" }).lean();
+
+    await audit({ action: "CONFIG_UPDATED", admin, metadata: { before: plain(current), changes: set } });
+    return updated;
+}
+
+// ─── Auditoría ───────────────────────────────────────────────────────
+async function audit({ action, admin, period = null, settlementId = null, partnerId = null, metadata = {}, session = null }) {
+    await PartnerPoolAuditLog.create(
+        [
+            {
+                action,
+                period,
+                settlementId,
+                partnerId,
+                adminUserId: admin.uid,
+                adminEmail: admin.email || null,
+                metadata,
+                occurredAt: new Date(),
+            },
+        ],
+        { session }
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  CÁLCULO (función pura: misma entrada → mismo resultado)
+// ══════════════════════════════════════════════════════════════════════
+//
+//  progressDelta   = pasos elegibles nuevos del período / totalEligibleSteps de la versión
+//  progressScore   = progressDelta × progressWeight (0,70)
+//  completionScore = completionWeight (0,30) si COURSE_COMPLETED ocurrió en el período
+//  totalScore      = progressScore + completionScore, con tope acumulado de 1 por
+//                    usuario + curso + versión (sumando períodos anteriores)
+//  weightedScore   = totalScore × courseWeight  → suma al curso y al Partner
+//
+//  Solo cuentan eventos con partnerPoolEligible = true. ADMIN y TEST nunca.
+//  Cursos con partnerPool.enabled = false y Partners inactivos no participan.
+
+const keyOf = (userId, courseId, version) => `${userId}|${courseId}|${version}`;
+const courseKeyOf = (courseId, version) => `${courseId}|${version}`;
+
+function computeConsumption({ events, versions, partners, previousScores, config }) {
+    const progressWeight = Number(config.progressWeight);
+    const completionWeight = Number(config.completionWeight);
+    const defaultCourseWeight = Number(config.defaultCourseWeight ?? 1);
+
+    const versionMap = new Map(versions.map((v) => [courseKeyOf(v.courseId, v.version), v]));
+    const eligibleSteps = new Map(
+        versions.map((v) => [
+            courseKeyOf(v.courseId, v.version),
+            new Set(v.steps.filter((s) => s.progressEligible).map((s) => s.stepId)),
+        ])
+    );
+    const partnerMap = new Map(partners.map((p) => [String(p._id), p]));
+
+    const participates = (v) => {
+        const p = partnerMap.get(String(v.partnerId));
+        return !!p && p.status === "ACTIVE" && p.partnerPool?.enabled !== false && v.partnerPool?.enabled !== false;
+    };
+
+    const warnings = { unknownVersions: new Set(), nonEligibleEvents: 0, excludedAccessEvents: 0 };
+    const enrollments = new Map(); // courseKey → count
+    const perUser = new Map();     // userKey → { userId, courseId, version, steps:Set, completed, accessType }
+
+    for (const e of events) {
+        const accessType = e.metadata?.accessType ?? null;
+        if (accessType && EXCLUDED_ACCESS.has(accessType)) {
+            warnings.excludedAccessEvents++;
+            continue;
+        }
+
+        const cKey = courseKeyOf(e.courseId, e.courseVersion);
+        const v = versionMap.get(cKey);
+        if (!v) {
+            warnings.unknownVersions.add(cKey);
+            continue;
+        }
+
+        if (e.eventType === EVENT_TYPES.COURSE_STARTED) {
+            enrollments.set(cKey, (enrollments.get(cKey) || 0) + 1);
+            continue;
+        }
+
+        if (e.metadata?.partnerPoolEligible !== true) {
+            warnings.nonEligibleEvents++;
+            continue;
+        }
+
+        const uKey = keyOf(e.userId, e.courseId, e.courseVersion);
+        if (!perUser.has(uKey)) {
+            perUser.set(uKey, {
+                userId: e.userId,
+                courseId: e.courseId,
+                version: e.courseVersion,
+                steps: new Set(),
+                completed: false,
+                accessType,
+            });
+        }
+        const u = perUser.get(uKey);
+        u.accessType = accessType || u.accessType;
+
+        if (e.eventType === EVENT_TYPES.STEP_COMPLETED) {
+            if (e.stepId && eligibleSteps.get(cKey).has(e.stepId)) u.steps.add(e.stepId);
+        } else if (e.eventType === EVENT_TYPES.COURSE_COMPLETED) {
+            u.completed = true;
+        }
+    }
+
+    const snapshots = [];
+    for (const [uKey, u] of perUser) {
+        const v = versionMap.get(courseKeyOf(u.courseId, u.version));
+        if (!participates(v)) continue;
+
+        const totalEligible = v.totalEligibleSteps || 0;
+        const newSteps = u.steps.size;
+        if (!newSteps && !u.completed) continue;
+
+        const progressDelta = totalEligible ? newSteps / totalEligible : 0;
+        const progressScore = progressDelta * progressWeight;
+        const completionScore = u.completed ? completionWeight : 0;
+        const rawScore = progressScore + completionScore;
+
+        const previous = previousScores.get(uKey) || 0;
+        const allowed = Math.max(0, 1 - previous);
+        const totalScore = Math.min(rawScore, allowed);
+        const cappedBy = rawScore - totalScore;
+
+        const courseWeight = v.partnerPool?.courseWeight ?? defaultCourseWeight;
+
+        snapshots.push({
+            userId: u.userId,
+            courseId: u.courseId,
+            courseVersion: u.version,
+            partnerId: String(v.partnerId),
+            accessType: u.accessType,
+            courseSnapshot: {
+                title: v.title,
+                totalEligibleSteps: totalEligible,
+                estimatedDurationMinutes: v.estimatedDurationMinutes ?? null,
+                moduleCount: v.moduleCount ?? 0,
+                courseWeight,
+            },
+            consumption: {
+                newCompletedSteps: newSteps,
+                progressDelta,
+                completedDuringPeriod: u.completed,
+                progressScore,
+                completionScore,
+                totalScore,
+                cappedBy: cappedBy > 1e-12 ? cappedBy : null,
+                weightedScore: totalScore * courseWeight,
+            },
+        });
+    }
+
+    // ── Consolidación: usuario → curso → Partner (sección 19) ────────
+    const partnerAgg = new Map(); // partnerId → { score, courses: Map }
+    const ensureCourse = (partnerId, courseId, version, title) => {
+        if (!partnerAgg.has(partnerId)) partnerAgg.set(partnerId, { score: 0, courses: new Map() });
+        const pa = partnerAgg.get(partnerId);
+        const cKey = courseKeyOf(courseId, version);
+        if (!pa.courses.has(cKey)) {
+            pa.courses.set(cKey, {
+                courseId,
+                courseVersion: version,
+                title,
+                enrollments: 0,
+                uniqueConsumers: 0,
+                completions: 0,
+                consumptionScore: 0,
+            });
+        }
+        return pa.courses.get(cKey);
+    };
+
+    for (const s of snapshots) {
+        const c = ensureCourse(s.partnerId, s.courseId, s.courseVersion, s.courseSnapshot.title);
+        c.consumptionScore += s.consumption.weightedScore;
+        if (s.consumption.totalScore > 0) c.uniqueConsumers++;
+        if (s.consumption.completedDuringPeriod) c.completions++;
+        partnerAgg.get(s.partnerId).score += s.consumption.weightedScore;
+    }
+
+    for (const [cKey, count] of enrollments) {
+        const v = versionMap.get(cKey);
+        if (!participates(v)) continue;
+        ensureCourse(String(v.partnerId), v.courseId, v.version, v.title).enrollments += count;
+    }
+
+    const globalScore = [...partnerAgg.values()].reduce((acc, p) => acc + p.score, 0);
+    const uniqueConsumers = new Set(snapshots.filter((s) => s.consumption.totalScore > 0).map((s) => s.userId));
+    const participatingCourses = new Set(
+        snapshots.filter((s) => s.consumption.weightedScore > 0).map((s) => courseKeyOf(s.courseId, s.courseVersion))
+    );
+
+    return {
+        snapshots,
+        partners: [...partnerAgg.entries()].map(([partnerId, pa]) => ({
+            partnerId,
+            partnerScore: pa.score,
+            partnerShare: globalScore ? pa.score / globalScore : 0,
+            courses: [...pa.courses.values()],
+        })),
+        globalScore,
+        metrics: {
+            uniqueEligibleConsumers: uniqueConsumers.size,
+            participatingCourses: participatingCourses.size,
+            participatingPartners: [...partnerAgg.values()].filter((p) => p.score > 0).length,
+        },
+        warnings: {
+            unknownVersions: [...warnings.unknownVersions],
+            nonEligibleEvents: warnings.nonEligibleEvents,
+            excludedAccessEvents: warnings.excludedAccessEvents,
+        },
+    };
+}
+
+// Enablement Factor — estrategia COURSE_EQUIVALENT (secciones 21 a 23)
+//   maximumPoolAmount = ingresos netos elegibles × maximumPoolRate (20%)
+//   consumptionTarget = suscripciones elegibles × consumptionTargetRate (50%)
+//   enablementFactor  = min(1, consumo total / consumptionTarget)
+//   enabledPoolAmount = maximumPoolAmount × enablementFactor
+//   Ejemplo del documento: 10.000.000 × 20% = 2.000.000 · meta 1.000 × 0,5 = 500 ·
+//   factor 300 / 500 = 0,60 · pool habilitado 1.200.000
+function computeFinancials({ revenue, eligibleSubscriptions, totalConsumptionScore, config }) {
+    if (config.enablementStrategy !== "COURSE_EQUIVALENT") {
+        throw httpError(500, `Estrategia de habilitación no soportada: ${config.enablementStrategy}`);
+    }
+    const maximumPoolAmount = revenue * Number(config.maximumPoolRate);
+    const consumptionTarget = eligibleSubscriptions * Number(config.consumptionTargetRate);
+    const enablementFactor = consumptionTarget > 0 ? Math.min(1, totalConsumptionScore / consumptionTarget) : 0;
+    return {
+        maximumPoolAmount,
+        consumptionTarget,
+        enablementFactor,
+        enabledPoolAmount: maximumPoolAmount * enablementFactor,
+    };
+}
+
+const finalAmountOf = (settlementAmount, adjustments) =>
+    adjustments.reduce(
+        (acc, a) => acc + (a.type === "CREDIT" ? 1 : -1) * Number(a.amount.toString()),
+        Number(settlementAmount.toString())
+    );
+
+// ══════════════════════════════════════════════════════════════════════
+//  FLUJO
+// ══════════════════════════════════════════════════════════════════════
+
+async function calculatePeriod(periodInput, admin) {
+    const { period, from, to } = parsePeriod(periodInput);
+    if (to > new Date()) throw httpError(409, "El período todavía no terminó: se calcula cuando cierra el mes");
+
+    // Bloqueo: solo un cálculo a la vez y nunca sobre períodos aprobados o cerrados
+    let previousStatus = "OPEN";
+    let locked = await PartnerPoolPeriod.findOneAndUpdate(
+        { period, status: { $in: ["OPEN", "CALCULATED"] } },
+        { $set: { status: "CALCULATING" } },
+        { returnDocument: "before" }
+    ).lean();
+
+    if (locked) {
+        previousStatus = locked.status;
+    } else {
+        const existing = await PartnerPoolPeriod.findOne({ period }).lean();
+        if (existing) {
+            throw httpError(
+                409,
+                existing.status === "CALCULATING"
+                    ? "El período ya se está calculando"
+                    : "El período está aprobado o cerrado: reabrilo para recalcular"
+            );
+        }
+        try {
+            await PartnerPoolPeriod.create({ period, status: "CALCULATING", range: { from, to } });
+        } catch {
+            throw httpError(409, "El período ya se está calculando");
+        }
+    }
+
+    try {
+        const config = await getConfig();
+
+        const [partners, events] = await Promise.all([
+            Partner.find({}).lean(),
+            CourseProgressEvent.find({
+                partnerId: { $ne: null },
+                occurredAt: { $gte: from, $lt: to },
+                eventType: { $in: [EVENT_TYPES.STEP_COMPLETED, EVENT_TYPES.COURSE_COMPLETED, EVENT_TYPES.COURSE_STARTED] },
+            })
+                .select("userId courseId courseVersion partnerId eventType stepId metadata occurredAt")
+                .lean(),
+        ]);
+
+        const pairs = [...new Set(events.map((e) => courseKeyOf(e.courseId, e.courseVersion)))].map((k) => {
+            const [courseId, version] = k.split("|");
+            return { courseId, version: Number(version) };
+        });
+        const versions = pairs.length ? await CourseVersion.find({ $or: pairs }).lean() : [];
+
+        // Puntos ya liquidados en períodos anteriores (para el tope de 1 por recorrido)
+        const userIds = [...new Set(events.map((e) => e.userId))];
+        const previousRows = userIds.length
+            ? await PartnerPoolConsumption.aggregate([
+                  { $match: { period: { $lt: period }, userId: { $in: userIds } } },
+                  {
+                      $group: {
+                          _id: { u: "$userId", c: "$courseId", v: "$courseVersion" },
+                          total: { $sum: "$consumption.totalScore" },
+                      },
+                  },
+              ])
+            : [];
+        const previousScores = new Map(previousRows.map((r) => [keyOf(r._id.u, r._id.c, r._id.v), num(r.total)]));
+
+        const result = computeConsumption({ events, versions, partners, previousScores, config });
+
+        const revenue = await computeRevenue({ from, to, revenueConfig: config.revenue || {} });
+        const fin = computeFinancials({
+            revenue: revenue.eligibleNetTrainingRevenue,
+            eligibleSubscriptions: revenue.eligibleSubscriptions,
+            totalConsumptionScore: result.globalScore,
+            config,
+        });
+
+        const now = new Date();
+        const partnerMap = new Map(partners.map((p) => [String(p._id), p]));
+
+        await runInTransaction(async (session) => {
+            // Snapshots: se reemplazan enteros (el período no está aprobado ni cerrado)
+            await PartnerPoolConsumption.deleteMany({ period }, { session });
+            if (result.snapshots.length) {
+                await PartnerPoolConsumption.insertMany(
+                    result.snapshots.map((s) => ({
+                        period,
+                        userId: s.userId,
+                        courseId: s.courseId,
+                        courseVersion: s.courseVersion,
+                        partnerId: s.partnerId,
+                        eligibility: { eligible: true, accessType: s.accessType },
+                        courseSnapshot: { ...s.courseSnapshot, courseWeight: toDec(s.courseSnapshot.courseWeight) },
+                        consumption: {
+                            newCompletedSteps: s.consumption.newCompletedSteps,
+                            progressDelta: toDec(s.consumption.progressDelta),
+                            completedDuringPeriod: s.consumption.completedDuringPeriod,
+                            progressScore: toDec(s.consumption.progressScore),
+                            completionScore: toDec(s.consumption.completionScore),
+                            totalScore: toDec(s.consumption.totalScore),
+                            cappedBy: s.consumption.cappedBy == null ? null : toDec(s.consumption.cappedBy),
+                            weightedScore: toDec(s.consumption.weightedScore),
+                        },
+                        formulaVersion: config.formulaVersion,
+                        calculatedAt: now,
+                    })),
+                    { session }
+                );
+            }
+
+            // Liquidaciones: se actualizan conservando ajustes y cancelaciones
+            const existing = await PartnerPoolSettlement.find({ period }).session(session).lean();
+            const existingByPartner = new Map(existing.map((s) => [String(s.partnerId), s]));
+            const computedPartners = new Set(result.partners.map((p) => p.partnerId));
+
+            const zeroFor = (partnerId) => ({ partnerId, partnerScore: 0, partnerShare: 0, courses: [] });
+            const toWrite = [
+                ...result.partners.filter((p) => p.partnerScore > 0 || existingByPartner.has(p.partnerId)),
+                ...[...existingByPartner.keys()].filter((id) => !computedPartners.has(id)).map(zeroFor),
+            ];
+
+            for (const p of toWrite) {
+                const partner = partnerMap.get(p.partnerId);
+                const prev = existingByPartner.get(p.partnerId);
+                const adjustments = prev?.adjustments || [];
+                const settlementAmount = toMoney(fin.enabledPoolAmount * p.partnerShare);
+                const finalAmount = toMoney(finalAmountOf(settlementAmount, adjustments));
+                const code = (partner?.code || p.partnerId).replace(/[^A-Za-z0-9]/g, "");
+
+                await PartnerPoolSettlement.updateOne(
+                    { period, partnerId: p.partnerId },
+                    {
+                        $set: {
+                            partnerSnapshot: {
+                                code: partner?.code || "",
+                                name: partner?.name || "",
+                                email: partner?.email || "",
+                            },
+                            formulaVersion: config.formulaVersion,
+                            courses: p.courses.map((c) => ({ ...c, consumptionScore: toDec(c.consumptionScore) })),
+                            partnerScore: toDec(p.partnerScore),
+                            globalScore: toDec(result.globalScore),
+                            partnerShare: toDec(p.partnerShare),
+                            enabledPoolAmount: toMoney(fin.enabledPoolAmount),
+                            settlementAmount,
+                            finalAmount,
+                            status: prev?.status === "CANCELLED" ? "CANCELLED" : "CALCULATED",
+                            calculatedAt: now,
+                            approvedAt: null,
+                            approvedBy: null,
+                        },
+                        $setOnInsert: { settlementId: `PPS-${period}-${code}`, adjustments: [] },
+                    },
+                    { upsert: true, session }
+                );
+            }
+
+            await PartnerPoolPeriod.updateOne(
+                { period },
+                {
+                    $set: {
+                        status: "CALCULATED",
+                        formulaVersion: config.formulaVersion,
+                        range: { from, to },
+                        configuration: {
+                            maximumPoolRate: toDec(config.maximumPoolRate),
+                            progressWeight: toDec(config.progressWeight),
+                            completionWeight: toDec(config.completionWeight),
+                            consumptionTargetRate: toDec(config.consumptionTargetRate),
+                            enablementStrategy: config.enablementStrategy,
+                            defaultCourseWeight: toDec(config.defaultCourseWeight ?? 1),
+                            revenue: plain(config.revenue || {}),
+                        },
+                        financials: {
+                            eligibleNetTrainingRevenue: toMoney(revenue.eligibleNetTrainingRevenue),
+                            maximumPoolAmount: toMoney(fin.maximumPoolAmount),
+                            enabledPoolAmount: toMoney(fin.enabledPoolAmount),
+                        },
+                        revenueBreakdown: {
+                            paymentsCount: revenue.breakdown.paymentsCount,
+                            grossAmount: toMoney(revenue.breakdown.grossAmount),
+                            feesAmount: toMoney(revenue.breakdown.feesAmount),
+                            estimatedFeePayments: revenue.breakdown.estimatedFeePayments,
+                            mixedPayments: revenue.breakdown.mixedPayments,
+                            mixedPaymentsAmount: toMoney(revenue.breakdown.mixedPaymentsAmount),
+                            excludedEnterprisePayments: revenue.breakdown.excludedEnterprisePayments,
+                        },
+                        metrics: {
+                            eligibleSubscriptions: revenue.eligibleSubscriptions,
+                            uniqueEligibleConsumers: result.metrics.uniqueEligibleConsumers,
+                            participatingCourses: result.metrics.participatingCourses,
+                            participatingPartners: result.metrics.participatingPartners,
+                            totalConsumptionScore: toDec(result.globalScore),
+                            consumptionTarget: toDec(fin.consumptionTarget),
+                            enablementFactor: toDec(fin.enablementFactor),
+                        },
+                        calculatedAt: now,
+                        calculatedBy: admin.uid,
+                        approvedAt: null,
+                        approvedBy: null,
+                        closedAt: null,
+                        closedBy: null,
+                    },
+                },
+                { session }
+            );
+
+            await audit({
+                action: "CALCULATED",
+                admin,
+                period,
+                session,
+                metadata: {
+                    recalculation: previousStatus === "CALCULATED",
+                    events: events.length,
+                    snapshots: result.snapshots.length,
+                    globalScore: result.globalScore,
+                    enabledPoolAmount: fin.enabledPoolAmount,
+                    warnings: result.warnings,
+                },
+            });
+        });
+
+        return { warnings: result.warnings };
+    } catch (err) {
+        // Si algo falló, el período vuelve al estado anterior
+        await PartnerPoolPeriod.updateOne({ period, status: "CALCULATING" }, { $set: { status: previousStatus } });
+        throw err;
+    }
+}
+
+async function approvePeriod(periodInput, admin) {
+    const { period } = parsePeriod(periodInput);
+    await runInTransaction(async (session) => {
+        const now = new Date();
+        const updated = await PartnerPoolPeriod.findOneAndUpdate(
+            { period, status: "CALCULATED" },
+            { $set: { status: "APPROVED", approvedAt: now, approvedBy: admin.uid } },
+            { session, returnDocument: "after" }
+        ).lean();
+        if (!updated) throw httpError(409, "Solo se aprueba un período calculado");
+
+        await PartnerPoolSettlement.updateMany(
+            { period, status: "CALCULATED" },
+            { $set: { status: "APPROVED", approvedAt: now, approvedBy: admin.uid } },
+            { session }
+        );
+        await audit({
+            action: "APPROVED",
+            admin,
+            period,
+            session,
+            metadata: { enabledPoolAmount: num(updated.financials.enabledPoolAmount) },
+        });
+    });
+}
+
+async function closePeriod(periodInput, admin) {
+    const { period } = parsePeriod(periodInput);
+    await runInTransaction(async (session) => {
+        const updated = await PartnerPoolPeriod.findOneAndUpdate(
+            { period, status: "APPROVED" },
+            { $set: { status: "CLOSED", closedAt: new Date(), closedBy: admin.uid } },
+            { session, returnDocument: "after" }
+        ).lean();
+        if (!updated) throw httpError(409, "Solo se cierra un período aprobado");
+        await audit({ action: "CLOSED", admin, period, session });
+    });
+}
+
+async function reopenPeriod(periodInput, reason, admin) {
+    const { period } = parsePeriod(periodInput);
+    if (!reason || String(reason).trim().length < 5) throw httpError(400, "Indicá el motivo de la reapertura");
+
+    await runInTransaction(async (session) => {
+        const paid = await PartnerPoolSettlement.countDocuments({ period, status: "PAID" }).session(session);
+        if (paid) throw httpError(409, "Hay liquidaciones pagadas: el período no se puede reabrir. Usá ajustes en el período siguiente.");
+
+        const before = await PartnerPoolPeriod.findOneAndUpdate(
+            { period, status: { $in: ["APPROVED", "CLOSED"] } },
+            { $set: { status: "CALCULATED", approvedAt: null, approvedBy: null, closedAt: null, closedBy: null } },
+            { session, returnDocument: "before" }
+        ).lean();
+        if (!before) throw httpError(409, "Solo se reabre un período aprobado o cerrado");
+
+        await PartnerPoolSettlement.updateMany(
+            { period, status: "APPROVED" },
+            { $set: { status: "CALCULATED", approvedAt: null, approvedBy: null } },
+            { session }
+        );
+        await audit({
+            action: "REOPENED",
+            admin,
+            period,
+            session,
+            metadata: { from: before.status, reason: String(reason).trim() },
+        });
+    });
+}
+
+// ─── Liquidaciones ───────────────────────────────────────────────────
+async function findSettlementOrFail(settlementId, session) {
+    const s = await PartnerPoolSettlement.findOne({ settlementId }).session(session).lean();
+    if (!s) throw httpError(404, "Liquidación no encontrada");
+    const p = await PartnerPoolPeriod.findOne({ period: s.period }).session(session).lean();
+    return { settlement: s, periodDoc: p };
+}
+
+async function addAdjustment(settlementId, { type, amount, reason }, admin) {
+    if (!["CREDIT", "DEBIT"].includes(type)) throw httpError(400, "El tipo de ajuste es CREDIT o DEBIT");
+    const value = Number(amount);
+    if (!Number.isFinite(value) || value <= 0) throw httpError(400, "El monto del ajuste tiene que ser mayor a 0");
+    if (!reason || String(reason).trim().length < 5) throw httpError(400, "Indicá el motivo del ajuste");
+
+    await runInTransaction(async (session) => {
+        const { settlement, periodDoc } = await findSettlementOrFail(settlementId, session);
+        if (!["CALCULATED", "APPROVED"].includes(settlement.status)) {
+            throw httpError(409, "Solo se ajustan liquidaciones calculadas o aprobadas");
+        }
+        if (periodDoc?.status === "CLOSED") throw httpError(409, "El período está cerrado: reabrilo para ajustar");
+
+        const adjustment = {
+            type,
+            amount: toMoney(value),
+            reason: String(reason).trim(),
+            createdBy: admin.uid,
+            createdAt: new Date(),
+        };
+        const adjustments = [...settlement.adjustments, adjustment];
+        const final = finalAmountOf(settlement.settlementAmount, adjustments);
+        if (final < 0) throw httpError(400, "El ajuste dejaría el monto final en negativo");
+
+        const updated = await PartnerPoolSettlement.findOneAndUpdate(
+            { settlementId, status: settlement.status },
+            { $push: { adjustments: adjustment }, $set: { finalAmount: toMoney(final) } },
+            { session, returnDocument: "after" }
+        ).lean();
+        if (!updated) throw httpError(409, "La liquidación cambió mientras se ajustaba, probá de nuevo");
+
+        const created = updated.adjustments[updated.adjustments.length - 1];
+        await audit({
+            action: "ADJUSTED",
+            admin,
+            period: settlement.period,
+            settlementId,
+            partnerId: settlement.partnerId,
+            session,
+            metadata: {
+                adjustmentId: created.adjustmentId,
+                type,
+                amount: value,
+                reason: adjustment.reason,
+                finalAmountBefore: num(settlement.finalAmount),
+                finalAmountAfter: final,
+            },
+        });
+    });
+}
+
+async function markPaid(settlementId, paymentReference, admin) {
+    if (!paymentReference || String(paymentReference).trim().length < 3) {
+        throw httpError(400, "Indicá la referencia del pago (transferencia, comprobante)");
+    }
+    await runInTransaction(async (session) => {
+        const { settlement, periodDoc } = await findSettlementOrFail(settlementId, session);
+        if (settlement.status !== "APPROVED") throw httpError(409, "Solo se paga una liquidación aprobada");
+        if (periodDoc?.status !== "CLOSED") throw httpError(409, "Primero hay que cerrar el período");
+
+        await PartnerPoolSettlement.updateOne(
+            { settlementId, status: "APPROVED" },
+            {
+                $set: {
+                    status: "PAID",
+                    paidAt: new Date(),
+                    paidBy: admin.uid,
+                    paymentReference: String(paymentReference).trim(),
+                },
+            },
+            { session }
+        );
+        await audit({
+            action: "PAID",
+            admin,
+            period: settlement.period,
+            settlementId,
+            partnerId: settlement.partnerId,
+            session,
+            metadata: { finalAmount: num(settlement.finalAmount), paymentReference: String(paymentReference).trim() },
+        });
+    });
+}
+
+async function cancelSettlement(settlementId, reason, admin) {
+    if (!reason || String(reason).trim().length < 5) throw httpError(400, "Indicá el motivo de la cancelación");
+    await runInTransaction(async (session) => {
+        const { settlement, periodDoc } = await findSettlementOrFail(settlementId, session);
+        if (!["CALCULATED", "APPROVED"].includes(settlement.status)) {
+            throw httpError(409, "Solo se cancela una liquidación calculada o aprobada");
+        }
+        if (periodDoc?.status === "CLOSED") throw httpError(409, "El período está cerrado: reabrilo para cancelar");
+
+        await PartnerPoolSettlement.updateOne(
+            { settlementId, status: settlement.status },
+            {
+                $set: {
+                    status: "CANCELLED",
+                    cancelledAt: new Date(),
+                    cancelledBy: admin.uid,
+                    cancelReason: String(reason).trim(),
+                },
+            },
+            { session }
+        );
+        await audit({
+            action: "CANCELLED",
+            admin,
+            period: settlement.period,
+            settlementId,
+            partnerId: settlement.partnerId,
+            session,
+            metadata: { reason: String(reason).trim(), finalAmount: num(settlement.finalAmount) },
+        });
+    });
+}
+
+// ─── Lecturas ────────────────────────────────────────────────────────
+async function listPeriods() {
+    const [periods, totals] = await Promise.all([
+        PartnerPoolPeriod.find({}).sort({ period: -1 }).limit(36).lean(),
+        PartnerPoolSettlement.aggregate([
+            { $match: { status: { $ne: "CANCELLED" } } },
+            {
+                $group: {
+                    _id: "$period",
+                    settlements: { $sum: 1 },
+                    paid: { $sum: { $cond: [{ $eq: ["$status", "PAID"] }, 1, 0] } },
+                    totalFinal: { $sum: "$finalAmount" },
+                },
+            },
+        ]),
+    ]);
+    const byPeriod = new Map(totals.map((t) => [t._id, t]));
+    return periods.map((p) => {
+        const t = byPeriod.get(p.period);
+        return plain({
+            period: p.period,
+            status: p.status,
+            enabledPoolAmount: p.financials?.enabledPoolAmount ?? null,
+            eligibleNetTrainingRevenue: p.financials?.eligibleNetTrainingRevenue ?? null,
+            settlements: t?.settlements ?? 0,
+            paid: t?.paid ?? 0,
+            totalFinal: t?.totalFinal ?? null,
+            calculatedAt: p.calculatedAt,
+        });
+    });
+}
+
+async function getPeriodDetail(periodInput) {
+    const { period, from, to } = parsePeriod(periodInput);
+    const [doc, settlements, auditLogs] = await Promise.all([
+        PartnerPoolPeriod.findOne({ period }).lean(),
+        PartnerPoolSettlement.find({ period }).sort({ finalAmount: -1 }).lean(),
+        PartnerPoolAuditLog.find({ period }).sort({ occurredAt: -1 }).limit(100).lean(),
+    ]);
+    return plain({
+        period: doc || { period, status: "OPEN", range: { from, to } },
+        canCalculate: to <= new Date(),
+        settlements,
+        auditLogs,
+    });
+}
+
+module.exports = {
+    // flujo
+    calculatePeriod,
+    approvePeriod,
+    closePeriod,
+    reopenPeriod,
+    addAdjustment,
+    markPaid,
+    cancelSettlement,
+    // lecturas
+    listPeriods,
+    getPeriodDetail,
+    getConfig,
+    updateConfig,
+    // puras (tests)
+    computeConsumption,
+    computeFinancials,
+    parsePeriod,
+    plain,
+};

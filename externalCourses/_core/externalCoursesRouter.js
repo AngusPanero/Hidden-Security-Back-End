@@ -9,11 +9,14 @@ const progressService = require("./services/progressService");
 const quizService = require("./services/quizService");
 const contentService = require("./services/contentService");
 
+const partnerPoolRouter = require("./partnerPoolRouter");
+
 // ─────────────────────────────────────────────────────────────────────
 // Router general de cursos de empresas externas.
 // En index.js:  app.use(externalCoursesRouter)
 //
 // GET  /api/external-courses                                       catálogo (público)
+// /api/external-courses/admin/partner-pool/...                     Partner Pool (solo admin, ver partnerPoolRouter.js)
 // GET  /api/external-courses/:partnerSlug/:courseSlug/structure    módulos y steps
 // GET  /api/external-courses/:partnerSlug/:courseSlug/progress     progreso del usuario
 // POST /api/external-courses/:partnerSlug/:courseSlug/start        empezar curso
@@ -24,19 +27,24 @@ const contentService = require("./services/contentService");
 
 const BASE = "/api/external-courses";
 
-const router = express.Router();
+const externalCoursesRouter = express.Router();
 const courseRouter = express.Router({ mergeParams: true });
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const ctxOf = (req) => ({ user: req.user, course: req.course, access: req.access });
 
 // ─── Catálogo público ────────────────────────────────────────────────
-router.get(BASE, (req, res) => {
+externalCoursesRouter.get(BASE, (req, res) => {
     res.json({ courses: getCatalog() });
 });
 
+// ─── Partner Pool (admin): métricas y liquidaciones ──────────────────
+// ⚠️ Tiene que ir ANTES del montaje /:partnerSlug/:courseSlug, si no
+//    "admin/partner-pool" se interpretaría como un curso.
+externalCoursesRouter.use(partnerPoolRouter);
+
 // ─── Un curso puntual: curso → sesión → acceso ───────────────────────
-router.use(
+externalCoursesRouter.use(
     `${BASE}/:partnerSlug/:courseSlug`,
     resolveCourse,
     auth,
@@ -89,7 +97,7 @@ courseRouter.use((req, res) => {
 });
 
 // ─── Errores (solo de este router) ───────────────────────────────────
-router.use(BASE, (err, req, res, next) => {
+externalCoursesRouter.use(BASE, (err, req, res, next) => {
     const status = err.status || 500;
     if (status === 500) console.error("[externalCourses]", err);
     if (res.headersSent) return res.end(); // falló a mitad de un PDF
@@ -99,4 +107,4 @@ router.use(BASE, (err, req, res, next) => {
     res.status(status).json(body);
 });
 
-module.exports = router;
+module.exports = externalCoursesRouter;

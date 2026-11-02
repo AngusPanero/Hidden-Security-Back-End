@@ -30,12 +30,18 @@ const { publicCertificateRouter } = require("./routes/publicCertificateRouter")
 const learningProgressRouter = require("./routes/learningProgressRouter")
 const presenceRouter = require("./routes/presenceRouter")
 const externalCoursesRouter = require("./externalCourses/_core/externalCoursesRouter")
+const partnerPoolRouter = require("./externalCourses/_core/partnerPoolRouter")
+const { loadCourses } = require("./externalCourses/_core/registry/courseRegistry");
+
 const app = express()
 const PORT = process.env.PORT
 
 app.set('trust proxy', 1); // Para el Rate Limiter
 
 dbConnection()
+    .then(() => loadCourses())
+    .then((r) => r && r.skipped && r.skipped.forEach((s) => console.warn("[externalCourses] salteado:", s.reason || s)))
+    .catch((err) => console.error("[startup]", err.message));
 
 app.use(cors({
     origin: [ `${process.env.LOCAL_LINK}`, `${process.env.LOCAL_HOST_MOBILE}`, `${process.env.API_BACKEND_URL}`, `${process.env.FRONT_END}`, `${process.env.FRONT_END_WWW}`, `${process.env.LOCAL_HOST}`].filter(Boolean),
@@ -77,6 +83,7 @@ app.use(publicCertificateRouter);
 app.use(learningProgressRouter)
 app.use(presenceRouter)
 app.use(externalCoursesRouter);
+app.use(partnerPoolRouter);
 
 app.use((req, res) => {
     res.send(`<h1>404 - Not Found</h1>`)
