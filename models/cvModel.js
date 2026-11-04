@@ -102,6 +102,29 @@ const cvSchema = new mongoose.Schema(
       default: "Inmediata",
     },
 
+    // ── Cursos externos (empresas partner) ─────────────────────
+    // LO ESCRIBE SOLO EL SERVIDOR al terminar un curso (completionService).
+    // PUT /api/cv/me no lo acepta: nadie puede cargarse un curso aprobado.
+    // Forma:
+    //   externalCourses: {
+    //     <partnerSlug>: {
+    //       partnerName: "Ciberprisma",
+    //       courses: {
+    //         <courseSlug>: {
+    //           courseId, title, courseVersion,
+    //           approved: true|false,   // solo pasa de false a true, nunca al revés
+    //           score: 0..1,            // mejor nota (solo sube)
+    //           basis: "FINAL_EXAM" | "ALL_QUIZZES",
+    //           completedAt, approvedAt, updatedAt,
+    //           skills: { grupo: [skills] }   // árbol del curso, solo si aprobó
+    //         }
+    //       }
+    //     }
+    //   }
+    // Sin default a propósito: así los updates por ruta ("externalCourses.x.y")
+    // no chocan con un objeto vacío al crear el CV.
+    externalCourses: { type: mongoose.Schema.Types.Mixed },
+
     // ── Preferencias de trabajo ────────────────────────────────
     workPreferences: {
       modality:     { type: [String], default: [] },    // ["Remoto", "Híbrido"]

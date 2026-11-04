@@ -66,6 +66,32 @@ function isValidCvPhotoUrl(value, uid) {
 // Estructura vacía por defecto para skills (evita undefined en clientes viejos)
 const EMPTY_SKILLS = { roles: [], habilidades: [], herramientas: [] };
 
+// ─── Helper: cursos externos para mostrar ─────────────────────────────────────
+// onlyApproved = true para empresas: ven solo los cursos aprobados (con sus skills),
+// nunca los intentos no aprobados del candidato.
+function formatExternalCourses(ext, onlyApproved) {
+  if (!ext || typeof ext !== "object") return {};
+  const out = {};
+  for (const [partnerSlug, partner] of Object.entries(ext)) {
+    const courses = {};
+    for (const [courseSlug, c] of Object.entries(partner?.courses || {})) {
+      if (!c || (onlyApproved && c.approved !== true)) continue;
+      courses[courseSlug] = {
+        courseId:    c.courseId    || null,
+        title:       c.title       || courseSlug,
+        approved:    c.approved === true,
+        score:       typeof c.score === "number" ? c.score : null,
+        basis:       c.basis       || null,
+        completedAt: c.completedAt || null,
+        approvedAt:  c.approvedAt  || null,
+        skills:      c.approved === true && c.skills && typeof c.skills === "object" ? c.skills : {},
+      };
+    }
+    if (Object.keys(courses).length) out[partnerSlug] = { partnerName: partner?.partnerName || partnerSlug, courses };
+  }
+  return out;
+}
+
 // ─── Helper: proyección limpia del CV para el propio usuario ─────────────────
 // Excluye campos internos de Mongo (_id de subdocs, __v, etc.)
 function formatCVForOwner(cv) {
@@ -81,6 +107,7 @@ function formatCVForOwner(cv) {
     projects:        cv.projects        || [],
     availability:    cv.availability    || null,
     workPreferences: cv.workPreferences || {},
+    externalCourses: formatExternalCourses(cv.externalCourses, false),
     updatedAt:       cv.updatedAt,
     createdAt:       cv.createdAt,
   };
@@ -110,6 +137,7 @@ function formatCVForEnterprise(cv) {
         salaryMax: cv.workPreferences.salaryMax,
       }),
     },
+    externalCourses: formatExternalCourses(cv.externalCourses, true),
     updatedAt: cv.updatedAt,
   };
 }
@@ -317,6 +345,9 @@ cvRouter.put("/api/cv/me", verifyToken, async (req, res) => {
       availability,
       workPreferences,
     } = req.body;
+
+    // externalCourses NO se toma del body a propósito: lo escribe solo el servidor
+    // al aprobar un curso. Mandarlo desde Postman no tiene ningún efecto.
 
     // Sanitizar todo el contenido antes de guardar — elimina HTML/scripts
     // sanitizeDeep es recursivo, así que soporta el objeto anidado

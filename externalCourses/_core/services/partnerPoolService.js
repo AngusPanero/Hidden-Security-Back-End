@@ -12,7 +12,7 @@ const { EVENT_TYPES } = require("../constants/eventTypes");
 const { ACCESS_TYPES } = require("../constants/accessTypes");
 const { httpError } = require("../utils/httpError");
 const { runInTransaction } = require("../utils/db");
-const { computeRevenue } = require("./partnerPoolRevenue");
+const { computeRevenue, hadEligiblePlan } = require("./partnerPoolRevenue");
 
 // ══════════════════════════════════════════════════════════════════════
 //  Partner Pool V1 — cálculo mensual, liquidaciones, ajustes y auditoría
@@ -93,16 +93,12 @@ async function updateConfig(changes, admin) {
     }
     if (changes.revenue && typeof changes.revenue === "object") {
         const r = changes.revenue;
-        if (r.includeEnterprisePayments !== undefined) set["revenue.includeEnterprisePayments"] = r.includeEnterprisePayments === true;
-        if (r.defaultMpFeeRate !== undefined) {
-            const v = Number(r.defaultMpFeeRate);
-            if (!Number.isFinite(v) || v < 0 || v >= 1) throw httpError(400, "defaultMpFeeRate inválido");
-            set["revenue.defaultMpFeeRate"] = v;
+        if (r.mpFeeRate !== undefined) {
+            const v = Number(r.mpFeeRate);
+            if (!Number.isFinite(v) || v < 0 || v >= 1) throw httpError(400, "mpFeeRate inválido (entre 0 y 1)");
+            set["revenue.mpFeeRate"] = v;
         }
-        if (r.excludedItems !== undefined) {
-            if (!Array.isArray(r.excludedItems)) throw httpError(400, "excludedItems tiene que ser una lista");
-            set["revenue.excludedItems"] = r.excludedItems.map((i) => String(i).trim().toLowerCase()).filter(Boolean);
-        }
+        // eligiblePlans y basePlan no se cambian desde la API: son reglas de negocio fijas
     }
 
     const progressW = set.progressWeight ?? current.progressWeight;
@@ -149,13 +145,18 @@ async function audit({ action, admin, period = null, settlementId = null, partne
 //                    usuario + curso + versión (sumando períodos anteriores)
 //  weightedScore   = totalScore × courseWeight  → suma al curso y al Partner
 //
-//  Solo cuentan eventos con partnerPoolEligible = true. ADMIN y TEST nunca.
-//  Cursos con partnerPool.enabled = false y Partners inactivos no participan.
+//  Un avance suma solo si, en el momento en que ocurrió:
+//   - lo hizo un alumno (admin, partner y enterprise nunca suman; ADMIN/TEST tampoco)
+//   - el alumno tenía un plan elegible pago y vigente (starter, pro o elite,
+//     con monto > $0), verificado contra los pagos guardados
+//   - la empresa dueña del curso no estaba baneada
+//  La inactividad nunca corta la comisión: solo se excluyen los cursos o
+//  empresas con partnerPool.enabled = false.
 
 const keyOf = (userId, courseId, version) => `${userId}|${courseId}|${version}`;
 const courseKeyOf = (courseId, version) => `${courseId}|${version}`;
 
-function computeConsumption({ events, versions, partners, previousScores, config }) {
+function computeConsumption({ events, versions, partners, previousScores, config, eligibility = null }) {
     const progressWeight = Number(config.progressWeight);
     const completionWeight = Number(config.completionWeight);
     const defaultCourseWeight = Number(config.defaultCourseWeight ?? 1);
@@ -171,10 +172,44 @@ function computeConsumption({ events, versions, partners, previousScores, config
 
     const participates = (v) => {
         const p = partnerMap.get(String(v.partnerId));
-        return !!p && p.status === "ACTIVE" && p.partnerPool?.enabled !== false && v.partnerPool?.enabled !== false;
+        return !!p && p.partnerPool?.enabled !== false && v.partnerPool?.enabled !== false;
     };
 
-    const warnings = { unknownVersions: new Set(), nonEligibleEvents: 0, excludedAccessEvents: 0 };
+    const warnings = {
+        unknownVersions: new Set(),
+        nonEligibleEvents: 0,
+        excludedAccessEvents: 0,
+        excludedRoleEvents: 0,
+        bannedPartnerEvents: 0,
+        noPaidPlanEvents: 0,
+    };
+
+    // ¿El evento cuenta para el pool? (ver reglas arriba)
+    const eventCounts = (e) => {
+        const role = e.metadata?.role ?? null;
+        const isStaff = role ? role !== "student" : !!eligibility?.staffUserIds?.has(String(e.userId));
+        if (isStaff) {
+            warnings.excludedRoleEvents++;
+            return false;
+        }
+        if (e.metadata?.partnerBanned === true) {
+            warnings.bannedPartnerEvents++;
+            return false;
+        }
+        if (eligibility) {
+            if (!hadEligiblePlan(eligibility.windowsByUser, e.userId, e.occurredAt)) {
+                warnings.noPaidPlanEvents++;
+                return false;
+            }
+            return true;
+        }
+        // Sin datos de pagos (solo tests): se usa la marca guardada en el evento
+        if (e.metadata?.partnerPoolEligible !== true) {
+            warnings.nonEligibleEvents++;
+            return false;
+        }
+        return true;
+    };
     const enrollments = new Map(); // courseKey → count
     const perUser = new Map();     // userKey → { userId, courseId, version, steps:Set, completed, accessType }
 
@@ -192,13 +227,10 @@ function computeConsumption({ events, versions, partners, previousScores, config
             continue;
         }
 
+        if (!eventCounts(e)) continue;
+
         if (e.eventType === EVENT_TYPES.COURSE_STARTED) {
             enrollments.set(cKey, (enrollments.get(cKey) || 0) + 1);
-            continue;
-        }
-
-        if (e.metadata?.partnerPoolEligible !== true) {
-            warnings.nonEligibleEvents++;
             continue;
         }
 
@@ -328,6 +360,9 @@ function computeConsumption({ events, versions, partners, previousScores, config
             unknownVersions: [...warnings.unknownVersions],
             nonEligibleEvents: warnings.nonEligibleEvents,
             excludedAccessEvents: warnings.excludedAccessEvents,
+            excludedRoleEvents: warnings.excludedRoleEvents,
+            bannedPartnerEvents: warnings.bannedPartnerEvents,
+            noPaidPlanEvents: warnings.noPaidPlanEvents,
         },
     };
 }
@@ -430,9 +465,17 @@ async function calculatePeriod(periodInput, admin) {
             : [];
         const previousScores = new Map(previousRows.map((r) => [keyOf(r._id.u, r._id.c, r._id.v), num(r.total)]));
 
-        const result = computeConsumption({ events, versions, partners, previousScores, config });
-
+        // Ingresos, suscripciones y planes vigentes de cada alumno (desde los pagos)
         const revenue = await computeRevenue({ from, to, revenueConfig: config.revenue || {} });
+
+        const result = computeConsumption({
+            events,
+            versions,
+            partners,
+            previousScores,
+            config,
+            eligibility: { windowsByUser: revenue.windowsByUser, staffUserIds: revenue.staffUserIds },
+        });
         const fin = computeFinancials({
             revenue: revenue.eligibleNetTrainingRevenue,
             eligibleSubscriptions: revenue.eligibleSubscriptions,
@@ -542,13 +585,16 @@ async function calculatePeriod(periodInput, admin) {
                             enabledPoolAmount: toMoney(fin.enabledPoolAmount),
                         },
                         revenueBreakdown: {
-                            paymentsCount: revenue.breakdown.paymentsCount,
+                            activePlans: revenue.breakdown.activePlans,
+                            planCounts: revenue.breakdown.planCounts,
+                            discountedPlans: revenue.breakdown.discountedPlans,
+                            excludedFreePayments: revenue.breakdown.excludedFreePayments,
+                            excludedStaffPlans: revenue.breakdown.excludedStaffPlans,
+                            basePlan: revenue.breakdown.basePlan,
+                            basePlanPrice: toMoney(revenue.breakdown.basePlanPrice),
+                            mpFeeRate: toDec(revenue.breakdown.mpFeeRate),
                             grossAmount: toMoney(revenue.breakdown.grossAmount),
                             feesAmount: toMoney(revenue.breakdown.feesAmount),
-                            estimatedFeePayments: revenue.breakdown.estimatedFeePayments,
-                            mixedPayments: revenue.breakdown.mixedPayments,
-                            mixedPaymentsAmount: toMoney(revenue.breakdown.mixedPaymentsAmount),
-                            excludedEnterprisePayments: revenue.breakdown.excludedEnterprisePayments,
                         },
                         metrics: {
                             eligibleSubscriptions: revenue.eligibleSubscriptions,

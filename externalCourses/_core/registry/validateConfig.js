@@ -1,6 +1,6 @@
 const fs = require("fs");
 const path = require("path");
-const { STEP_TYPES, STEP_TYPE_LIST, QUIZ_STEP_TYPES } = require("../constants/stepTypes");
+const { STEP_TYPES, STEP_TYPE_LIST, QUIZ_STEP_TYPES, MIN_PASS_SCORE } = require("../constants/stepTypes");
 
 // Valida partner.config.js y course.config.js al arrancar.
 // Si algo está mal, el curso NO se carga y el log dice exactamente qué corregir.
@@ -8,6 +8,17 @@ const { STEP_TYPES, STEP_TYPE_LIST, QUIZ_STEP_TYPES } = require("../constants/st
 const ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/; // minúsculas, números y guiones: cp-fdcs-m01-s01
 const SLUG_RE = /^[A-Za-z0-9-]+$/;
 const COURSE_STATUSES = ["ACTIVE", "DRAFT", "INACTIVE"];
+
+const EMAIL_RE = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
+
+function isSafeHttpsUrl(value) {
+    if (typeof value !== "string" || value.length > 500 || /["'<>\s]/.test(value)) return false;
+    try {
+        return new URL(value).protocol === "https:";
+    } catch {
+        return false;
+    }
+}
 
 const same = (a, b) => String(a || "").toLowerCase() === String(b || "").toLowerCase();
 
@@ -27,6 +38,47 @@ function validatePartnerConfig(pc, folderName) {
     if (!same(pc.slug, folderName)) e.push(`slug "${pc.slug}" no coincide con la carpeta "${folderName}"`);
     if (!/^PT-\d{4}$/.test(pc.code || "")) e.push(`code "${pc.code}" inválido (formato PT-0001)`);
     if (!pc.name) e.push("falta name");
+    if (pc.email !== undefined && pc.email !== "" && !EMAIL_RE.test(String(pc.email))) {
+        e.push(`email "${pc.email}" inválido (tiene que ser el email de la cuenta partner de Firebase)`);
+    }
+    if (pc.logoUrl !== undefined && pc.logoUrl !== "" && !isSafeHttpsUrl(pc.logoUrl)) {
+        e.push("logoUrl tiene que ser una URL https:// válida (se muestra en los certificados)");
+    }
+    fail(where, e);
+}
+
+// ─── skills/<archivo>.js ─────────────────────────────────────────────
+// Árbol de skills que valida el curso: { "Grupo": ["Skill", ...], ... }
+const SKILLS_LIMITS = { groups: 30, perGroup: 80, total: 400, text: 120 };
+
+function validateSkillsTree(tree, where) {
+    const e = [];
+    if (!tree || typeof tree !== "object" || Array.isArray(tree)) {
+        fail(where, ["tiene que exportar un objeto { grupo: [skills] }"]);
+    }
+    const groups = Object.entries(tree);
+    if (!groups.length) e.push("no tiene grupos");
+    if (groups.length > SKILLS_LIMITS.groups) e.push(`tiene más de ${SKILLS_LIMITS.groups} grupos`);
+
+    let total = 0;
+    for (const [group, list] of groups) {
+        if (!group.trim() || group.length > SKILLS_LIMITS.text || /[.$<>]/.test(group)) {
+            e.push(`grupo "${group}" inválido (sin puntos, $, < ni >; hasta ${SKILLS_LIMITS.text} caracteres)`);
+        }
+        if (!Array.isArray(list) || !list.length) {
+            e.push(`grupo "${group}": tiene que ser una lista con al menos una skill`);
+            continue;
+        }
+        if (list.length > SKILLS_LIMITS.perGroup) e.push(`grupo "${group}": más de ${SKILLS_LIMITS.perGroup} skills`);
+        list.forEach((skill, i) => {
+            if (typeof skill !== "string" || !skill.trim() || skill.length > SKILLS_LIMITS.text || /[<>]/.test(skill)) {
+                e.push(`grupo "${group}" skill #${i + 1} inválida`);
+            }
+        });
+        if (new Set(list).size !== list.length) e.push(`grupo "${group}": tiene skills repetidas`);
+        total += list.length;
+    }
+    if (total > SKILLS_LIMITS.total) e.push(`tiene más de ${SKILLS_LIMITS.total} skills en total`);
     fail(where, e);
 }
 
@@ -157,11 +209,16 @@ function validateCourseConfig({ config, quizzes, partnerFolder, courseFolder, co
                     usedQuizIds.add(s.quizId);
                     validateQuiz(s.quizId, quizzes && quizzes[s.quizId], sw, e);
                 }
-                if (typeof s.passScore !== "number" || s.passScore <= 0 || s.passScore > 1) {
-                    e.push(`${sw}: passScore tiene que ser un número entre 0 y 1 (ej: 0.7)`);
+                // passScore es opcional: si falta se usa el mínimo (80%). Nunca puede ser menor.
+                if (
+                    s.passScore !== undefined &&
+                    (typeof s.passScore !== "number" || s.passScore < MIN_PASS_SCORE || s.passScore > 1)
+                ) {
+                    e.push(`${sw}: passScore tiene que estar entre ${MIN_PASS_SCORE} y 1 (mínimo ${MIN_PASS_SCORE * 100}%)`);
                 }
-                if (s.maxAttempts != null && (!Number.isInteger(s.maxAttempts) || s.maxAttempts < 1)) {
-                    e.push(`${sw}: maxAttempts tiene que ser un entero >= 1 o null`);
+                // Los reintentos son siempre ilimitados
+                if (s.maxAttempts != null) {
+                    e.push(`${sw}: maxAttempts no está permitido (los reintentos son ilimitados), borralo`);
                 }
             }
         });
@@ -179,4 +236,4 @@ function validateCourseConfig({ config, quizzes, partnerFolder, courseFolder, co
     });
 }
 
-module.exports = { validatePartnerConfig, validateCourseConfig };
+module.exports = { validatePartnerConfig, validateCourseConfig, validateSkillsTree, isSafeHttpsUrl };

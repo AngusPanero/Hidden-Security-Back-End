@@ -19,14 +19,12 @@ const PartnerPoolConfigSchema = new mongoose.Schema(
         defaultCourseWeight: { type: Number, default: 1 },
 
         // Cómo se sacan los ingresos y suscripciones de la colección payments
+        // (ver partnerPoolRevenue.js). Todo plan elegible se valúa como el plan base.
         revenue: {
             source: { type: String, enum: ["PAYMENTS"], default: "PAYMENTS" },
-            // ⚠️ Confirmar con la clienta: los planes de empresa, ¿son formación o servicio corporativo?
-            includeEnterprisePayments: { type: Boolean, default: false },
-            // Items que no son formación (no suman ingresos ni suscripciones)
-            excludedItems: { type: [String], default: ["voucher"] },
-            // Comisión de MP que se asume en pagos viejos sin netAmount
-            defaultMpFeeRate: { type: Number, default: 0.05 },
+            eligiblePlans: { type: [String], default: ["starter", "pro", "elite"] },
+            basePlan: { type: String, default: "starter" },
+            mpFeeRate: { type: Number, default: 0.05 }, // comisión de Mercado Pago que se descuenta
         },
 
         updatedBy: { type: String, default: null },

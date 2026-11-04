@@ -36,13 +36,16 @@ const PartnerPoolPeriodSchema = new mongoose.Schema(
 
         // Detalle de cómo se armaron los ingresos (para que el admin pueda revisarlos)
         revenueBreakdown: {
-            paymentsCount: { type: Number, default: 0 },
-            grossAmount: { type: D, default: null },
-            feesAmount: { type: D, default: null },
-            estimatedFeePayments: { type: Number, default: 0 },
-            mixedPayments: { type: Number, default: 0 },      // traían items excluidos junto con un plan
-            mixedPaymentsAmount: { type: D, default: null },
-            excludedEnterprisePayments: { type: Number, default: 0 },
+            activePlans: { type: Number, default: 0 },           // alumnos con plan elegible vigente en el mes
+            planCounts: { type: mongoose.Schema.Types.Mixed, default: {} }, // { starter, pro, elite }
+            discountedPlans: { type: Number, default: 0 },       // planes con cupón (< 100%)
+            excludedFreePayments: { type: Number, default: 0 },  // cupón 100%: no cuentan
+            excludedStaffPlans: { type: Number, default: 0 },    // planes de admin / partner / enterprise
+            basePlan: { type: String, default: "starter" },
+            basePlanPrice: { type: D, default: null },
+            mpFeeRate: { type: D, default: null },
+            grossAmount: { type: D, default: null },             // valor starter prorrateado del mes
+            feesAmount: { type: D, default: null },              // comisión de Mercado Pago
         },
 
         metrics: {

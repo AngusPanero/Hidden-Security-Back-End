@@ -16,4 +16,8 @@ const DIRECT_COMPLETE_TYPES = [STEP_TYPES.CONTENT, STEP_TYPES.VIDEO];
 // Steps que se completan solo aprobando en POST /quiz/:quizId/submit
 const QUIZ_STEP_TYPES = [STEP_TYPES.QUIZ, STEP_TYPES.FINAL_EXAM];
 
-module.exports = { STEP_TYPES, STEP_TYPE_LIST, DIRECT_COMPLETE_TYPES, QUIZ_STEP_TYPES };
+// Nota mínima para aprobar CUALQUIER evaluación (quiz de módulo o examen final)
+// y para que el curso quede aprobado en el CV. Ningún curso puede pedir menos.
+const MIN_PASS_SCORE = 0.8;
+
+module.exports = { STEP_TYPES, STEP_TYPE_LIST, DIRECT_COMPLETE_TYPES, QUIZ_STEP_TYPES, MIN_PASS_SCORE };

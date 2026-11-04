@@ -12,10 +12,11 @@ const ACCESS_TYPES = Object.freeze({
 });
 
 // Política comercial: qué accesos participan del Partner Pool.
-// ⚠️ Confirmar con la clienta PROMOTION, SCHOLARSHIP y COMPANY_PLAN.
+// Solo alumnos con plan de suscripción pago (starter, pro, elite).
+// La verificación final es contra los pagos al liquidar (partnerPoolRevenue.js).
 const POOL_ELIGIBILITY = Object.freeze({
     PAID_PLAN: true,
-    COMPANY_PLAN: true,
+    COMPANY_PLAN: false,
     PROMOTION: false,
     SCHOLARSHIP: false,
     ADMIN: false,
@@ -25,7 +26,10 @@ const POOL_ELIGIBILITY = Object.freeze({
 // Planes que se consideran contratados por una empresa
 const COMPANY_PLANS = ["business", "enterprise"];
 
+// Planes que suman al Partner Pool (puntos e ingresos). Ningún otro.
+const POOL_PLANS = ["starter", "pro", "elite"];
+
 // Compras que no son planes (no dan acceso a cursos)
 const NON_PLAN_PURCHASES = ["voucher"];
 
-module.exports = { ACCESS_TYPES, POOL_ELIGIBILITY, COMPANY_PLANS, NON_PLAN_PURCHASES };
+module.exports = { ACCESS_TYPES, POOL_ELIGIBILITY, COMPANY_PLANS, NON_PLAN_PURCHASES, POOL_PLANS };

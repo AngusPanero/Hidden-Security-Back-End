@@ -5,18 +5,27 @@ const {
     NON_PLAN_PURCHASES,
 } = require("../constants/accessTypes");
 
+// ⚠️ Ajustá la ruta si tu config de Firebase está en otro lugar
+const auth = require("../../../config/firebase");
+
 // ─────────────────────────────────────────────────────────────────────
 // Decide si req.user puede cursar req.course y con qué tipo de acceso.
-// Deja req.access = { accessType, plan, partnerPoolEligible }
-// que después se guarda en cada evento.
+// Deja req.access = { accessType, plan, role, partnerBanned, partnerPoolEligible }
+// que después se guarda en cada evento (historial inmutable).
 //
-// Reglas actuales:
+// Reglas de acceso:
 // - admin           → entra siempre (también a cursos DRAFT), no suma al Pool
 // - test            → entra siempre, no suma al Pool
 // - curso DRAFT     → solo admin/test (el resto recibe 404)
 // - resto           → necesita un plan vigente (purchases + purchaseExpiry)
-//                     y que ese plan esté en course.access.plans ("ANY" = cualquiera)
-// ⚠️ Confirmar con la clienta qué planes dan acceso a cursos de partners.
+//
+// Para el Pool se guarda además, en el momento del avance:
+// - role:          student | admin | partner | enterprise  (solo "student" suma)
+// - partnerBanned: si la cuenta partner de la empresa estaba baneada desde
+//                  ClaimsManager. Lo hecho durante un ban nunca suma, aunque
+//                  después se la desbanee.
+// La plata y la elegibilidad final se verifican contra los PAGOS al liquidar
+// (partnerPoolRevenue.js): un plan dado a mano o con cupón 100% no suma.
 // ─────────────────────────────────────────────────────────────────────
 
 function getActivePlans(claims) {
@@ -31,6 +40,13 @@ function getActivePlans(claims) {
             const e = expiry[p];
             return e && new Date(e).getTime() > now;
         });
+}
+
+function roleOf(user) {
+    if (user.admin === true || user.isAdmin === true) return "admin";
+    if (user.partner === true) return "partner";
+    if (user.isEnterprise === true) return "enterprise";
+    return "student";
 }
 
 function resolveAccess(user, course) {
@@ -57,7 +73,6 @@ function resolveAccess(user, course) {
         };
     }
 
-    // Si tiene algún plan personal, cuenta como PAID_PLAN; si solo tiene planes de empresa, COMPANY_PLAN
     const personal = activePlans.find((p) => !COMPANY_PLANS.includes(p));
     return {
         allowed: true,
@@ -66,22 +81,62 @@ function resolveAccess(user, course) {
     };
 }
 
-module.exports = function requireCourseAccess(req, res, next) {
-    const access = resolveAccess(req.user, req.course);
+// ─── ¿La empresa está baneada ahora? ─────────────────────────────────
+// Se busca la cuenta partner de Firebase por el email de partner.config.js.
+// Caché corta (60 s) para no consultar Firebase en cada paso del alumno.
+const BAN_CACHE_MS = 60 * 1000;
+const banCache = new Map(); // email → { banned, at }
 
-    if (!access.allowed) {
-        return res.status(access.status).json({ error: access.message });
+async function isPartnerBanned(email) {
+    if (!email) return false; // sin email configurado no hay cuenta que banear
+    const cached = banCache.get(email);
+    if (cached && Date.now() - cached.at < BAN_CACHE_MS) return cached.banned;
+
+    let banned;
+    try {
+        const record = await auth.getUserByEmail(email);
+        banned = record.customClaims?.banned === true || record.disabled === true;
+    } catch (err) {
+        if (err?.code === "auth/user-not-found") {
+            banned = false;
+        } else {
+            // Firebase no respondió: no se cachea y el evento queda marcado como desconocido
+            console.error("[externalCourses] no se pudo verificar el ban del partner:", err.message);
+            return null;
+        }
     }
+    banCache.set(email, { banned, at: Date.now() });
+    return banned;
+}
 
-    req.access = {
-        accessType: access.accessType,
-        plan: access.plan,
-        partnerPoolEligible:
-            POOL_ELIGIBILITY[access.accessType] === true &&
-            req.course.partnerPool.enabled &&
-            req.course.status === "ACTIVE",
-    };
-    next();
+module.exports = async function requireCourseAccess(req, res, next) {
+    try {
+        const access = resolveAccess(req.user, req.course);
+
+        if (!access.allowed) {
+            return res.status(access.status).json({ error: access.message });
+        }
+
+        const role = roleOf(req.user);
+        const partnerBanned = await isPartnerBanned(req.course.partnerEmail);
+
+        req.access = {
+            accessType: access.accessType,
+            plan: access.plan,
+            role,
+            partnerBanned,
+            partnerPoolEligible:
+                POOL_ELIGIBILITY[access.accessType] === true &&
+                role === "student" &&
+                partnerBanned === false &&
+                req.course.partnerPool.enabled &&
+                req.course.status === "ACTIVE",
+        };
+        next();
+    } catch (err) {
+        next(err);
+    }
 };
 
 module.exports.resolveAccess = resolveAccess;
+module.exports.isPartnerBanned = isPartnerBanned;

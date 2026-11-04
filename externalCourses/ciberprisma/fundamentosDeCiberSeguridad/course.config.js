@@ -2,6 +2,8 @@
 //
 // SIMULACIÓN: usa los PDFs y las preguntas de los módulos 1 a 3 de ModernSoc.
 // Cada módulo = socIntro + soc1…socN + socFinal + quiz (mismo orden que ModernSoc).
+// Todas las evaluaciones piden 80% (es el mínimo de la plataforma) y se pueden
+// reintentar sin límite. Las skills que valida el curso están en skills/.
 // Regla de oro: un stepId nunca se reutiliza ni se renombra. Si cambia la
 // estructura, se sube "version".
 
@@ -33,7 +35,7 @@ module.exports = {
                 { stepId: "cp-fdcs-m01-s06", type: "CONTENT", title: "Contenido 5", file: "module-01/soc5.pdf", required: true, progressEligible: true },
                 { stepId: "cp-fdcs-m01-s07", type: "CONTENT", title: "Contenido 6", file: "module-01/soc6.pdf", required: true, progressEligible: true },
                 { stepId: "cp-fdcs-m01-s08", type: "CONTENT", title: "Cierre del módulo", file: "module-01/socFinal.pdf", required: true, progressEligible: true },
-                { stepId: "cp-fdcs-m01-q01", type: "QUIZ", title: "Evaluación módulo 1", quizId: "m01-quiz", passScore: 0.7, required: true, progressEligible: true },
+                { stepId: "cp-fdcs-m01-q01", type: "QUIZ", title: "Evaluación módulo 1", quizId: "m01-quiz", passScore: 0.8, required: true, progressEligible: true },
             ],
         },
         {
@@ -50,7 +52,7 @@ module.exports = {
                 { stepId: "cp-fdcs-m02-s08", type: "CONTENT", title: "Contenido 7", file: "module-02/soc7.pdf", required: true, progressEligible: true },
                 { stepId: "cp-fdcs-m02-s09", type: "CONTENT", title: "Contenido 8", file: "module-02/soc8.pdf", required: true, progressEligible: true },
                 { stepId: "cp-fdcs-m02-s10", type: "CONTENT", title: "Cierre del módulo", file: "module-02/socFinal.pdf", required: true, progressEligible: true },
-                { stepId: "cp-fdcs-m02-q01", type: "QUIZ", title: "Evaluación módulo 2", quizId: "m02-quiz", passScore: 0.7, required: true, progressEligible: true },
+                { stepId: "cp-fdcs-m02-q01", type: "QUIZ", title: "Evaluación módulo 2", quizId: "m02-quiz", passScore: 0.8, required: true, progressEligible: true },
             ],
         },
         {
@@ -68,7 +70,7 @@ module.exports = {
                 { stepId: "cp-fdcs-m03-s09", type: "CONTENT", title: "Contenido 8", file: "module-03/soc8.pdf", required: true, progressEligible: true },
                 { stepId: "cp-fdcs-m03-s10", type: "CONTENT", title: "Contenido 9", file: "module-03/soc9.pdf", required: true, progressEligible: true },
                 { stepId: "cp-fdcs-m03-s11", type: "CONTENT", title: "Cierre del módulo", file: "module-03/socFinal.pdf", required: true, progressEligible: true },
-                { stepId: "cp-fdcs-m03-q01", type: "QUIZ", title: "Evaluación módulo 3", quizId: "m03-quiz", passScore: 0.7, required: true, progressEligible: true },
+                { stepId: "cp-fdcs-m03-q01", type: "QUIZ", title: "Evaluación módulo 3", quizId: "m03-quiz", passScore: 0.8, required: true, progressEligible: true },
             ],
         },
     ],

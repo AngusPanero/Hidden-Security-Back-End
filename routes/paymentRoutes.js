@@ -1142,3 +1142,9 @@ paymentsRouter.patch("/api/payments/:id/checked", adminMiddleware, async (req, r
 });
 
 module.exports = paymentsRouter;
+
+// Precios y duraciones: los lee el Partner Pool (partnerPoolRevenue.js) para
+// valuar cada plan como un starter. Una sola fuente de verdad: si cambia un
+// precio acá, el pool lo toma solo.
+module.exports.PLAN_PRICES    = PLAN_PRICES;
+module.exports.PLAN_DURATIONS = PLAN_DURATIONS;

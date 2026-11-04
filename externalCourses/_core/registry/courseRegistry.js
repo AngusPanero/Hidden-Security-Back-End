@@ -1,9 +1,9 @@
 const fs = require("fs");
 const path = require("path");
 const Partner = require("../schemas/PartnerSchema");
-const { validatePartnerConfig, validateCourseConfig } = require("./validateConfig");
+const { validatePartnerConfig, validateCourseConfig, validateSkillsTree } = require("./validateConfig");
 const { syncCourseVersion } = require("./syncCourseVersions");
-const { STEP_TYPES, QUIZ_STEP_TYPES } = require("../constants/stepTypes");
+const { STEP_TYPES, QUIZ_STEP_TYPES, MIN_PASS_SCORE } = require("../constants/stepTypes");
 
 // ─────────────────────────────────────────────────────────────────────
 // Registro de cursos externos.
@@ -13,6 +13,7 @@ const { STEP_TYPES, QUIZ_STEP_TYPES } = require("../constants/stepTypes");
 //   externalCourses/<empresa>/<curso>/course.config.js
 //   externalCourses/<empresa>/<curso>/quiz.questions.js
 //   externalCourses/<empresa>/<curso>/content/...
+//   externalCourses/<empresa>/<curso>/skills/<archivo>.js   (árbol de skills del curso)
 //
 // Las carpetas que empiezan con "_" o "." se ignoran (ej: _core).
 // Un curso con errores NO tumba el server: se saltea y se loguea el motivo.
@@ -71,6 +72,8 @@ function buildPublicStructure(course) {
             status: course.status,
             estimatedDurationMinutes: course.estimatedDurationMinutes,
             sequential: course.sequential,
+            hasFinalExam: !!course.finalExamStepId,
+            minPassScore: MIN_PASS_SCORE,
             moduleCount: course.modules.length,
             totalSteps: course.totalSteps,
             totalEligibleSteps: course.totalEligibleSteps,
@@ -113,7 +116,7 @@ function buildPublicStructure(course) {
     };
 }
 
-function buildRuntimeCourse({ config, quizzes, partner, contentDir }) {
+function buildRuntimeCourse({ config, quizzes, partner, contentDir, skills }) {
     const steps = [];
     let index = 0;
 
@@ -131,8 +134,9 @@ function buildRuntimeCourse({ config, quizzes, partner, contentDir }) {
                 file: s.file || null,
                 url: s.url || null,
                 quizId: s.quizId || null,
-                passScore: s.passScore ?? null,
-                maxAttempts: s.maxAttempts ?? null,
+                // Quizzes y examen final: mínimo 80%, reintentos ilimitados
+                passScore: QUIZ_STEP_TYPES.includes(s.type) ? Math.max(s.passScore ?? MIN_PASS_SCORE, MIN_PASS_SCORE) : null,
+                maxAttempts: null,
                 durationMinutes: s.durationMinutes ?? null,
             });
             steps.push(step);
@@ -146,6 +150,7 @@ function buildRuntimeCourse({ config, quizzes, partner, contentDir }) {
         partnerSlug: partner.slug,
         partnerName: partner.name,
         partnerLogoUrl: partner.logoUrl || "",
+        partnerEmail: String(partner.email || "").trim().toLowerCase(), // cuenta partner de Firebase (para el ban)
 
         courseId: config.courseId,
         courseSlug: config.courseSlug,
@@ -170,6 +175,11 @@ function buildRuntimeCourse({ config, quizzes, partner, contentDir }) {
 
         totalSteps: steps.length,
         totalEligibleSteps: steps.filter((s) => s.progressEligible).length,
+
+        // Aprobación para el CV: con examen final cuenta el final; sin final, todas las evaluaciones
+        finalExamStepId: (steps.find((s) => s.type === STEP_TYPES.FINAL_EXAM) || {}).stepId || null,
+        quizStepIds: steps.filter((s) => QUIZ_STEP_TYPES.includes(s.type)).map((s) => s.stepId),
+        skills: skills || null,
     };
 
     course.publicStructure = buildPublicStructure(course);
@@ -189,6 +199,34 @@ function buildRuntimeCourse({ config, quizzes, partner, contentDir }) {
     return Object.freeze(course);
 }
 
+// skills/<archivo>.js: el nombre del archivo y de la constante puede ser cualquiera.
+// Acepta module.exports = { NOMBRE: { grupo: [...] } } o directamente { grupo: [...] }.
+function loadSkills(courseDir, where) {
+    const dir = path.join(courseDir, "skills");
+    if (!fs.existsSync(dir)) {
+        console.warn(`[externalCourses] aviso: ${where} no tiene carpeta skills/ (el CV no va a mostrar skills)`);
+        return null;
+    }
+    const files = fs
+        .readdirSync(dir, { withFileTypes: true })
+        .filter((d) => d.isFile() && d.name.endsWith(".js") && !d.name.startsWith("."))
+        .map((d) => d.name);
+
+    if (!files.length) {
+        console.warn(`[externalCourses] aviso: ${where}/skills no tiene ningún .js`);
+        return null;
+    }
+    if (files.length > 1) throw new Error(`skills/ tiene más de un archivo (${files.join(", ")}): dejá uno solo`);
+
+    const exported = freshRequire(path.join(dir, files[0]));
+    const values = exported && typeof exported === "object" ? Object.values(exported) : [];
+    const isTree = values.length && values.every(Array.isArray);
+    const tree = isTree ? exported : values.length === 1 ? values[0] : null;
+
+    validateSkillsTree(tree, `${where}/skills/${files[0]}`);
+    return Object.freeze(Object.fromEntries(Object.entries(tree).map(([g, l]) => [g, Object.freeze([...l])])));
+}
+
 async function loadCourse({ partner, partnerFolder, courseFolder, courseDir }) {
     const configPath = path.join(courseDir, "course.config.js");
     if (!fs.existsSync(configPath)) return null; // carpeta sin curso todavía
@@ -203,8 +241,9 @@ async function loadCourse({ partner, partnerFolder, courseFolder, courseDir }) {
     const contentDir = path.join(courseDir, "content");
 
     validateCourseConfig({ config, quizzes, partnerFolder, courseFolder, contentDir });
+    const skills = loadSkills(courseDir, `${partnerFolder}/${courseFolder}`);
 
-    const course = buildRuntimeCourse({ config, quizzes, partner, contentDir });
+    const course = buildRuntimeCourse({ config, quizzes, partner, contentDir, skills });
 
     // Solo los cursos publicados quedan congelados. DRAFT se puede seguir editando.
     if (course.status === "ACTIVE") await syncCourseVersion(course);

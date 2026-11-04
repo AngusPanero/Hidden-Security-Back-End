@@ -48,6 +48,8 @@ async function recordEvent({
                 ? {
                       accessType: access.accessType,
                       plan: access.plan ?? null,
+                      role: access.role ?? null,                   // student | admin | partner | enterprise
+                      partnerBanned: access.partnerBanned ?? null, // la empresa estaba baneada en este momento
                       partnerPoolEligible: access.partnerPoolEligible === true,
                   }
                 : {}),

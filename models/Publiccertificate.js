@@ -35,6 +35,15 @@ const publicCertificateSchema = new mongoose.Schema(
     status:        { type: String, enum: ["active", "revoked"], default: "active" },
     revokedAt:     { type: Date, default: null },
     revokedReason: { type: String, default: null },
+
+
+
+    kind:           { type: String, enum: ["hidden", "external"], default: "hidden" },
+    partnerSlug:    { type: String, default: null },
+    partnerName:    { type: String, default: null },
+    partnerLogoUrl: { type: String, default: null },
+    courseSlug:     { type: String, default: null },
+    facts:          { type: [String], default: [] },
   },
   { timestamps: true }
 );

@@ -1,6 +1,6 @@
 const Progress = require("../schemas/ExternalCourseProgressSchema");
 const { recordEvent } = require("./eventService");
-const { checkCompletion } = require("./completionService");
+const { checkCompletion, computeApproval, syncCourseRecord } = require("./completionService");
 const { EVENT_TYPES } = require("../constants/eventTypes");
 const { DIRECT_COMPLETE_TYPES } = require("../constants/stepTypes");
 const { ACCESS_TYPES } = require("../constants/accessTypes");
@@ -68,7 +68,7 @@ function findProgress(userId, courseId, session = null) {
 }
 
 // Lo que recibe el front
-function serialize(p, course) {
+function serialize(p, course, approval = null) {
     if (!p) {
         return {
             started: false,
@@ -81,6 +81,7 @@ function serialize(p, course) {
             quizResults: {},
             isCompleted: false,
             completedAt: null,
+            approval: { ...computeApproval(course, null), certificate: null },
         };
     }
 
@@ -97,6 +98,7 @@ function serialize(p, course) {
         quizResults: p.quizResults || {},
         isCompleted: p.isCompleted,
         completedAt: p.completedAt,
+        approval: approval || { ...computeApproval(course, p), certificate: null },
     };
 }
 
@@ -146,7 +148,18 @@ async function migrateVersion(ctx, progress) {
 async function get(ctx) {
     let p = await findProgress(ctx.user.uid, ctx.course.courseId);
     if (p && p.courseVersion !== ctx.course.version) p = await migrateVersion(ctx, p);
-    return serialize(p, ctx.course);
+
+    // Curso completo: se asegura que la aprobación esté en el CV y que el
+    // certificado exista (idempotente; también repara si el alumno borró su CV)
+    let approval = null;
+    if (p && p.isCompleted) {
+        try {
+            approval = await syncCourseRecord(ctx, p);
+        } catch (err) {
+            console.error("[externalCourses] syncCourseRecord falló:", err.message);
+        }
+    }
+    return serialize(p, ctx.course, approval);
 }
 
 async function start(ctx) {
