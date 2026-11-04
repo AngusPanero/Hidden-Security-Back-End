@@ -38,7 +38,7 @@ const publicCertificateSchema = new mongoose.Schema(
 
 
 
-    kind:           { type: String, enum: ["hidden", "external"], default: "hidden" },
+    kind:           { type: String, enum: ["hidden", "external", "course"], default: "hidden" },
     partnerSlug:    { type: String, default: null },
     partnerName:    { type: String, default: null },
     partnerLogoUrl: { type: String, default: null },

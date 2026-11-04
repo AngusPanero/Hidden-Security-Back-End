@@ -71,9 +71,25 @@ function generateCredentialId(prefix) {
   return `HS-${prefix}-${randomBlock(4)}-${randomBlock(4)}-${randomBlock(4)}`;
 }
 
-// Cursos de partners: certId = "ext:<courseId>" y kind = "external"
+// Certificados de CURSO terminado (no de examen):
+//  • kind "external" → cursos de empresas partner   (certId "ext:<courseId>")
+//  • kind "course"   → cursos propios de Hidden      (certId "course:<courseId>")
+// Los dos usan la ruta /cursos/:partnerSlug/:courseSlug/certificado/:credentialId
 const EXTERNAL_PREFIX = "ext:";
-const isExternal = (doc) => doc?.kind === "external";
+const HIDDEN_COURSE_PREFIX = "course:";
+const isExternal = (doc) => doc?.kind === "external" || doc?.kind === "course";
+
+// Cursos propios de Hidden que emiten certificado de finalización.
+// Cada curso nuevo de Hidden suma su entrada acá (la clave es el courseId de config/courses.js).
+const HIDDEN_COURSE_CATALOG = {
+  soc1: {
+    courseSlug: "modernSoc",                 // → /cursos/hidden-security/modernSoc/certificado/:id
+    prefix:     "CMSOC",                     // → HS-CMSOC-XXXX-XXXX-XXXX (el examen usa MSOC)
+    title:      "Modern SOC Operations",
+    facts:      ["8 módulos", "Evaluación por módulo", "Aprobación mínima 80%"],
+  },
+};
+const HIDDEN_ISSUER = { partnerSlug: "hidden-security", partnerName: "Hidden Security" };
 
 function certificateUrl(doc) {
   if (isExternal(doc)) {
@@ -121,7 +137,7 @@ async function resolveHolderName(userId, holderName, useDisplayName = true) {
 function publicView(doc) {
   const base = {
     credentialId: doc.credentialId,
-    kind:         isExternal(doc) ? "external" : "hidden",
+    kind:         doc?.kind === "external" || doc?.kind === "course" ? doc.kind : "hidden",
     slug:         doc.slug,
     holderName:   doc.holderName,
     title:        doc.title,
@@ -283,6 +299,46 @@ async function issueExternalCourseCertificate({ userId, course, score, issuedAt 
   });
 }
 
+/**
+ * Cursos propios de Hidden (Modern SOC Operations). La llama courseRouter
+ * cuando el alumno completa el curso. El nombre sale SIEMPRE del CV.
+ * @param {object} p
+ * @param {string} p.userId
+ * @param {string} p.courseId  ej. "soc1"
+ * @param {number} [p.score]   0..1
+ * @param {Date}   [p.issuedAt]
+ */
+async function issueHiddenCourseCertificate({ userId, courseId, score, issuedAt } = {}) {
+  const c = HIDDEN_COURSE_CATALOG[courseId];
+  if (!c) {
+    console.error(`issueHiddenCourseCertificate: curso sin certificado (${courseId})`);
+    return null;
+  }
+  const cfg = {
+    slug:    c.courseSlug,
+    prefix:  c.prefix,
+    title:   c.title,
+    program: HIDDEN_ISSUER.partnerName,
+    skill:   c.title,
+    extra: {
+      kind:           "course",
+      partnerSlug:    HIDDEN_ISSUER.partnerSlug,
+      partnerName:    HIDDEN_ISSUER.partnerName,
+      partnerLogoUrl: null,               // el front usa el logo de Hidden
+      courseSlug:     c.courseSlug,
+      facts:          c.facts,
+    },
+  };
+  return issueWithConfig({
+    userId,
+    certId: `${HIDDEN_COURSE_PREFIX}${courseId}`,
+    cfg,
+    useDisplayName: false,
+    score,
+    issuedAt,
+  });
+}
+
 // ─── Rutas ──────────────────────────────────────────────────────────────────
 
 const publicLimiter = rateLimit({
@@ -359,4 +415,11 @@ publicCertificateRouter.get("/api/certificates/mine", verifyToken, async (req, r
   }
 });
 
-module.exports = { publicCertificateRouter, issueCertificate, issueExternalCourseCertificate, CERTIFICATE_CATALOG };
+module.exports = {
+  publicCertificateRouter,
+  issueCertificate,
+  issueExternalCourseCertificate,
+  issueHiddenCourseCertificate,
+  CERTIFICATE_CATALOG,
+  HIDDEN_COURSE_CATALOG,
+};

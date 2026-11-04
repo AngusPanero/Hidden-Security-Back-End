@@ -1,4 +1,5 @@
 const express        = require("express");
+const rateLimit      = require("express-rate-limit");
 const courseRouter   = express.Router();
 const CourseProgress = require("../models/CourseSchema");
 const verifyToken    = require("../middleware/authMiddleware");
@@ -8,6 +9,7 @@ const fs = require("fs");
 const path = require("path");
 const { pipeline } = require("stream/promises");
 const { SOC1_CONTENT_DIR, SOC1_PDF_BY_STEP } = require("../config/soc1Content");
+const { issueHiddenCourseCertificate } = require("./publicCertificateRouter");
 
 const esProduccion = process.env.NODE_ENV === "production";
 
@@ -45,6 +47,18 @@ async function requireActivePlan(req, res, next) {
     res.status(500).json({ message: "Error verificando membresía" });
   }
 }
+
+// El admin revisa el contenido sin necesitar un plan
+function requireActivePlanOrAdmin(req, res, next) {
+  if (req.user?.admin === true) return next();
+  return requireActivePlan(req, res, next);
+}
+
+// --- Nota mínima de aprobación ------------------------------------------------
+// 80% en todos los quizzes de todos los cursos, sin importar lo que diga
+// config/courses.js. Se decide acá (backend): el front solo la muestra.
+const MIN_PASS_SCORE = 0.8;
+const passScoreOf = (course) => Math.max(Number(course.passingScore) || 0, MIN_PASS_SCORE);
 
 // --- Helper: validar courseId contra whitelist -----------------------------
 function getCourse(courseId, res) {
@@ -98,6 +112,68 @@ async function grantCourseCompletedClaim(uid, course) {
   }
 }
 
+// --- Helper: ¿se completó el curso? (atómico) --------------------------------
+// Todos los steps hechos + todos los quizzes aprobados. La transición a
+// completado se hace con findOneAndUpdate({ isCompleted: false }): si llegan
+// dos pedidos a la vez, solo uno la gana y la claim se otorga una sola vez.
+async function markCompletedIfDone(progress, course, uid) {
+  if (!progress || progress.isCompleted) return progress;
+
+  const done = new Set(progress.completedSteps || []);
+  const allStepsDone = Array.from({ length: course.totalSteps }, (_, i) => i).every(i => done.has(i));
+  const allQuizzesPassed = course.quizSteps.every(qi => progress.quizResults?.[String(qi)]?.passed === true);
+  if (!allStepsDone || !allQuizzesPassed) return progress;
+
+  const updated = await CourseProgress.findOneAndUpdate(
+    { _id: progress._id, isCompleted: false },
+    { $set: { isCompleted: true, completedAt: new Date() } },
+    { returnDocument: "after" }
+  );
+  if (!updated) return CourseProgress.findById(progress._id); // otro pedido lo completó primero
+
+  await grantCourseCompletedClaim(uid, course);
+  return updated;
+}
+
+// --- Helper: nota del curso = promedio de la MEJOR nota de cada quiz ----------
+function courseScore(progress, course) {
+  const scores = course.quizSteps.map(qi => {
+    const r = progress.quizResults?.[String(qi)];
+    return Math.max(Number(r?.bestScore) || 0, Number(r?.score) || 0);
+  });
+  return scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null;
+}
+
+// --- Helper: certificado de finalización del curso ---------------------------
+// Idempotente: si ya existe devuelve el mismo link (y completa el nombre si el
+// alumno lo cargó en el CV después). Nunca rompe la respuesta del progreso.
+async function ensureCourseCertificate(progress, course, courseId, uid) {
+  if (!progress?.isCompleted) return null;
+  try {
+    return await issueHiddenCourseCertificate({
+      userId:   uid,
+      courseId,
+      score:    courseScore(progress, course),
+      issuedAt: progress.completedAt || new Date(),
+    });
+  } catch (err) {
+    console.error("Error emitiendo certificado del curso:", err.message);
+    return null;
+  }
+}
+
+// --- Rate limit de quizzes por usuario ---------------------------------------
+// Los reintentos son ilimitados, pero sin límite de velocidad alguien podría
+// automatizar envíos para deducir las respuestas por la nota de cada intento.
+const quizLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.uid || "anon",
+  message: { message: "Demasiados intentos seguidos. Esperá unos minutos y volvé a intentar." },
+});
+
 // --- GET /api/course/:courseId/progress -------------------------------------
 courseRouter.get("/api/course/:courseId/progress", verifyToken, requireActivePlan, async (req, res) => {
   try {
@@ -107,9 +183,20 @@ courseRouter.get("/api/course/:courseId/progress", verifyToken, requireActivePla
     const course = getCourse(courseId, res);
     if (!course) return;
 
-    const progress = await findOrCreateProgress(userId, courseId);
+    let progress = await findOrCreateProgress(userId, courseId);
+    // Repara alumnos que ya tenían todo hecho pero quedaron sin marcar completos
+    progress = await markCompletedIfDone(progress, course, userId);
 
-    res.json({ data: progress });
+    // Curso completo: certificado de finalización (también para quienes
+    // terminaron antes de que existiera)
+    const certificate = await ensureCourseCertificate(progress, course, courseId, userId);
+
+    res.json({
+      data:        progress,
+      score:       progress.isCompleted ? courseScore(progress, course) : null,
+      passingScore: passScoreOf(course),
+      certificate,
+    });
   } catch (err) {
     console.error(esProduccion ? "Error GET progress" : `Error GET progress: ${err}`);
     res.status(500).json({ message: "Error al obtener progreso" });
@@ -148,7 +235,7 @@ courseRouter.get("/api/course/:courseId/quiz/:stepIndex", verifyToken, requireAc
       data: {
         stepIndex,
         moduleNumber,
-        passingScore: course.passingScore,
+        passingScore: passScoreOf(course),
         questions,
       },
     });
@@ -182,35 +269,26 @@ courseRouter.patch("/api/course/:courseId/progress/step", verifyToken, requireAc
 
     const progress = await findOrCreateProgress(userId, courseId);
 
-    if (!progress.completedSteps.includes(stepIndex)) {
-      progress.completedSteps.push(stepIndex);
+    // Solo se puede marcar un step al que el alumno ya llegó. Sin esto, desde
+    // Postman se podían marcar los 88 steps sin leer nada y completar el curso.
+    if (!isStepUnlocked(progress, stepIndex)) {
+      return res.status(403).json({ message: "Completá las etapas anteriores para avanzar" });
     }
 
-    progress.currentStep = Math.max(progress.currentStep, stepIndex + 1);
-
-    const wasCompleted = progress.isCompleted;
-
-    const allQuizzesPassed = course.quizSteps.every(qi => {
-      const result = progress.quizResults?.[String(qi)];
-      return result?.passed === true;
-    });
-
-    const allStepsDone = progress.completedSteps.length >= course.totalSteps;
-
-    if (allStepsDone && allQuizzesPassed && !wasCompleted) {
-      progress.isCompleted = true;
-      progress.completedAt = new Date();
-    }
-
-    await progress.save();
+    // Atómico: $addToSet no duplica y $max nunca hace retroceder currentStep,
+    // aunque lleguen dos pedidos a la vez
+    let updated = await CourseProgress.findOneAndUpdate(
+      { _id: progress._id },
+      { $addToSet: { completedSteps: stepIndex }, $max: { currentStep: stepIndex + 1 } },
+      { returnDocument: "after" }
+    );
+    updated = await markCompletedIfDone(updated, course, userId);
 
     // Las skills del curso NO se escriben acá — usersDatabaseRouter las
     // deriva leyendo isCompleted desde Mongo (límite de 1000 bytes de Firebase).
-    if (!wasCompleted && progress.isCompleted) {
-    await grantCourseCompletedClaim(userId, course);
-  }
+    const certificate = await ensureCourseCertificate(updated, course, courseId, userId);
 
-    res.json({ data: progress });
+    res.json({ data: updated, certificate });
   } catch (err) {
     console.error(esProduccion ? "Error PATCH step" : `Error PATCH step: ${err}`);
     res.status(500).json({ message: "Error al guardar progreso" });
@@ -223,7 +301,7 @@ courseRouter.patch("/api/course/:courseId/progress/step", verifyToken, requireAc
 //   - answer es el TEXTO de la opción elegida, no un índice
 // La corrección vive en el banco (gradeQuiz): compara el texto contra la
 // opción correcta, que nunca sale del backend.
-courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, requireActivePlan, async (req, res) => {
+courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, quizLimiter, requireActivePlan, async (req, res) => {
   try {
     const { courseId }           = req.params;
     const userId                 = req.user.uid;
@@ -244,7 +322,7 @@ courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, requireAc
 
     const { correct, total } = grading;
     const score  = correct / total;
-    const passed = score >= course.passingScore;
+    const passed = score >= passScoreOf(course);
 
     const progress = await findOrCreateProgress(userId, courseId);
 
@@ -252,53 +330,41 @@ courseRouter.patch("/api/course/:courseId/progress/quiz", verifyToken, requireAc
       return res.status(403).json({ message: "Completá las etapas anteriores para rendir este quiz" });
     }
 
-    // Estado ANTES de tocar nada — para detectar la transición a completado
-    // sin volver a otorgar la claim en reintentos posteriores.
-    const wasCompleted = progress.isCompleted;
+    // Reintentos ilimitados, también después de aprobar:
+    // - un quiz aprobado NUNCA vuelve a quedar desaprobado
+    // - se guarda siempre la MEJOR nota (bestScore)
+    // Todo atómico ($inc / $max), así dos envíos en paralelo no se pisan.
+    const key       = String(stepIndex);
+    const prev      = progress.quizResults?.[key];
+    const wasPassed = prev?.passed === true;
+    const prevBest  = Math.max(Number(prev?.bestScore) || 0, Number(prev?.score) || 0);
+    const base      = `quizResults.${key}`;
 
-    const prevAttempts = progress.quizResults?.[String(stepIndex)]?.attempts ?? 0;
-
-    progress.quizResults = {
-      ...progress.quizResults,
-      [String(stepIndex)]: {
-        score,
-        passed,
-        attempts:      prevAttempts + 1,
-        lastAttemptAt: new Date(),
-      },
+    const update = {
+      $set: { [`${base}.score`]: score, [`${base}.lastAttemptAt`]: new Date() },
+      $inc: { [`${base}.attempts`]: 1 },
+      $max: { [`${base}.bestScore`]: Math.max(prevBest, score) },
     };
-
+    if (passed || !prev) update.$set[`${base}.passed`] = passed || wasPassed;
     if (passed) {
-      if (!progress.completedSteps.includes(stepIndex)) {
-        progress.completedSteps.push(stepIndex);
-      }
-      progress.currentStep = Math.max(progress.currentStep, stepIndex + 1);
+      update.$addToSet = { completedSteps: stepIndex };
+      update.$max.currentStep = stepIndex + 1;
     }
 
-    const allQuizzesPassed = course.quizSteps.every(qi => {
-      const result = progress.quizResults?.[String(qi)];
-      return result?.passed === true;
-    });
-    const allStepsDone = progress.completedSteps.length >= course.totalSteps;
-
-    if (allStepsDone && allQuizzesPassed && !wasCompleted) {
-      progress.isCompleted = true;
-      progress.completedAt = new Date();
-    }
-
-    await progress.save();
-
-    if (!wasCompleted && progress.isCompleted) {
-      await grantCourseCompletedClaim(userId, course);
-    }
+    let updated = await CourseProgress.findOneAndUpdate({ _id: progress._id }, update, { returnDocument: "after" });
+    updated = await markCompletedIfDone(updated, course, userId);
+    const certificate = await ensureCourseCertificate(updated, course, courseId, userId);
 
     res.json({
-      data:         progress,
+      data:          updated,
       passed,
+      alreadyPassed: wasPassed,
       score,
+      bestScore:     Math.max(prevBest, score),
       correct,
       total,
-      passingScore: course.passingScore,
+      passingScore:  passScoreOf(course),
+      certificate,
     });
   } catch (err) {
     console.error(esProduccion ? "Error PATCH quiz" : `Error PATCH quiz: ${err}`);
@@ -313,12 +379,18 @@ courseRouter.get("/api/course/progress-summary", verifyToken, async (req, res) =
     const userId = req.user.uid;
     const progressDocs = await CourseProgress.find({ userId }).lean();
 
-    const summary = progressDocs.map((p) => {
+    // Solo cursos que siguen existiendo en config/courses.js
+    const summary = progressDocs.filter((p) => COURSES[p.courseId]).map((p) => {
       const course     = COURSES[p.courseId];
-      const totalSteps = course?.totalSteps ?? 0;
+      const totalSteps = course.totalSteps ?? 0;
       const percent    = totalSteps > 0
-        ? Math.round((p.completedSteps.length / totalSteps) * 100)
+        ? Math.min(100, Math.round((p.completedSteps.length / totalSteps) * 100))
         : 0;
+
+      // Quizzes: se calculan acá con la mejor nota guardada (el front solo muestra)
+      const quizSteps     = course.quizSteps || [];
+      const taken         = quizSteps.filter((qi) => p.quizResults?.[String(qi)]);
+      const quizzesPassed = quizSteps.filter((qi) => p.quizResults?.[String(qi)]?.passed === true).length;
 
       return {
         courseId:       p.courseId,
@@ -329,6 +401,18 @@ courseRouter.get("/api/course/progress-summary", verifyToken, async (req, res) =
         isCompleted:    p.isCompleted,
         startedAt:      p.startedAt,
         completedAt:    p.completedAt,
+        quizzesTotal:   quizSteps.length,
+        quizzesTaken:   taken.length,
+        quizzesPassed,
+        // Promedio de la mejor nota de los quizzes rendidos (null si no rindió ninguno).
+        // Con el curso completo están todos rendidos: es la misma nota del certificado.
+        score:          taken.length
+          ? taken.reduce((acc, qi) => {
+              const r = p.quizResults[String(qi)];
+              return acc + Math.max(Number(r.bestScore) || 0, Number(r.score) || 0);
+            }, 0) / taken.length
+          : null,
+        passingScore:   passScoreOf(course),
       };
     });
 
@@ -341,7 +425,7 @@ courseRouter.get("/api/course/progress-summary", verifyToken, async (req, res) =
 
 // ── PDF protegido del curso SOC ──────────────────────────────────────
 // Solo con sesión, membresía activa y step desbloqueado.
-courseRouter.get("/api/course/:courseId/content/:stepIndex", verifyToken, async (req, res) => {
+courseRouter.get("/api/course/:courseId/content/:stepIndex", verifyToken, requireActivePlanOrAdmin, async (req, res) => {
     try {
         const { courseId } = req.params;
         const stepIndex = Number(req.params.stepIndex);
@@ -356,24 +440,14 @@ courseRouter.get("/api/course/:courseId/content/:stepIndex", verifyToken, async 
         const user = req.user;
         const isAdmin = user.admin === true;
 
-        // ⚠️ 1) MEMBRESÍA: usá la MISMA validación que ya tenés en GET /progress.
-        //    Si ahí llamás a una función (ej: hasActiveMembership), llamala acá.
-        //    Esto es el equivalente con purchases + purchaseExpiry de las claims:
-        if (!isAdmin) {
-            const purchases = Array.isArray(user.purchases) ? user.purchases : [];
-            const expiry = user.purchaseExpiry || {};
-            const active = purchases.some(
-                (p) => p !== "voucher" && expiry[p] && new Date(expiry[p]) > new Date()
-            );
-            if (!active) return res.status(403).json({ message: "Necesitás una membresía activa." });
-        }
+        // 1) MEMBRESÍA: la valida requireActivePlanOrAdmin en la ruta (la misma
+        //    regla que el resto del curso). Antes alcanzaba con CUALQUIER plan que
+        //    no fuera voucher, así que business/enterprise también entraban.
 
-        // ⚠️ 2) STEP DESBLOQUEADO: usá tu modelo de progreso (el mismo de /progress)
+        // 2) STEP DESBLOQUEADO: mismo criterio que /quiz y /progress/step
         if (!isAdmin) {
             const progress = await CourseProgress.findOne({ userId: user.uid, courseId }).lean();
-            const completed = progress?.completedSteps ?? [];
-            const current = progress?.currentStep ?? 0;
-            if (stepIndex > current && !completed.includes(stepIndex)) {
+            if (!progress || !isStepUnlocked(progress, stepIndex)) {
                 return res.status(403).json({ message: "Completá la etapa anterior para desbloquear." });
             }
         }
