@@ -59,7 +59,7 @@ async function checkCompletion(ctx, progress, session) {
 
 function computeApproval(course, progress) {
     const basis = course.finalExamStepId ? "FINAL_EXAM" : "ALL_QUIZZES";
-    const empty = { completed: false, approved: false, score: null, basis, minScore: MIN_PASS_SCORE };
+    const empty = { completed: false, approved: false, score: null, basis, minScore: MIN_PASS_SCORE, pending: [] };
     if (!progress || !progress.isCompleted) return empty;
 
     const results = progress.quizResults || {};
@@ -82,7 +82,18 @@ function computeApproval(course, progress) {
         score = null;
     }
 
-    return { completed: true, approved, score, basis, minScore: MIN_PASS_SCORE };
+    // Evaluaciones que todavía no llegan al 80% (por ejemplo, aprobadas cuando el
+    // mínimo era 70%): el front las muestra para que el alumno sepa cuál reintentar
+    const toCheck = course.finalExamStepId ? [course.finalExamStepId] : course.quizStepIds;
+    const pending = toCheck
+        .filter((id) => !ok(id))
+        .map((id) => ({
+            stepId: id,
+            title: course.stepsById.get(id)?.title || id,
+            bestScore: best(id),
+        }));
+
+    return { completed: true, approved, score, basis, minScore: MIN_PASS_SCORE, pending };
 }
 
 // externalCourses.<partnerSlug>.courses.<courseSlug> — los slugs ya están validados
