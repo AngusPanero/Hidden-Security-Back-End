@@ -583,7 +583,10 @@ async function approve(courseIdIn, versionIn, body, admin) {
     ).lean();
     if (!updated) throw httpError(409, "La duración cambió mientras se aprobaba, probá de nuevo");
 
-    await audit("DURATION_APPROVED", admin, { courseId, version, hours, previousHours: previous, estimateHours, source, justification });
+    await audit("DURATION_APPROVED", admin, {
+        courseId, version, hours, previousHours: previous, estimateHours, source, justification,
+        signedWithPin: admin.signedWithPin === true,
+    });
     await refreshPublishable();
     return getDetail(courseId, version);
 }
@@ -641,7 +644,9 @@ async function inheritPrevious(courseIdIn, versionIn, reasonIn, admin) {
     ).lean();
     if (!updated) throw httpError(409, "La duración cambió mientras se heredaba, probá de nuevo");
 
-    await audit("DURATION_INHERITED", admin, { courseId, version, fromVersion: prev.version, hours, reason });
+    await audit("DURATION_INHERITED", admin, {
+        courseId, version, fromVersion: prev.version, hours, reason, signedWithPin: admin.signedWithPin === true,
+    });
     await refreshPublishable();
     return getDetail(courseId, version);
 }
@@ -662,7 +667,7 @@ async function confirmContent(courseIdIn, versionIn, reasonIn, admin) {
         { returnDocument: "after" }
     ).lean();
     if (!updated) throw httpError(409, "La duración cambió mientras se confirmaba, probá de nuevo");
-    await audit("DURATION_CONTENT_CONFIRMED", admin, { courseId, version, reason });
+    await audit("DURATION_CONTENT_CONFIRMED", admin, { courseId, version, reason, signedWithPin: admin.signedWithPin === true });
     return getDetail(courseId, version);
 }
 

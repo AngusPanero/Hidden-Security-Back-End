@@ -1,4 +1,5 @@
 const express = require("express");
+const rateLimit = require("express-rate-limit");
 const usersDatabaseRouter = express.Router();
 const { CV } = require("../models/cvModel");
 const auth = require("../config/firebase"); // mismo export que usa tu script certifySkills.js
@@ -6,6 +7,36 @@ const enterpriseMiddleware = require("../middleware/enterpriseMiddleware");
 const { readCompletedCourses, getCourseSkillsFromClaims } = require("../config/courses");
 
 const esProduccion = process.env.NODE_ENV === "production";
+
+// ─── Validación de la query ────────────────────────────────────────────────────
+// Express puede entregar un parámetro como string, como array (?a=1&a=2) o como
+// objeto (?a[$ne]=x). Acá solo se aceptan strings: lo demás se ignora.
+const SEARCH_MAX_LEN   = 100;  // largo máximo del texto de búsqueda
+const SKILL_MAX_LEN    = 120;  // largo máximo de cada skill pedida
+const SKILLS_MAX_COUNT = 30;   // skills pedidas como máximo por filtro
+
+// Mismas opciones que el enum de cvModel y que el front
+const AVAILABILITY_OPTIONS = ["Inmediata", "2 semanas", "1 mes", "No disponible"];
+const MODALITY_OPTIONS     = ["Remoto", "Presencial", "Híbrido"];
+
+const queryString = (v, max) => (typeof v === "string" ? v.trim().slice(0, max) : "");
+
+const queryList = (v) =>
+  typeof v === "string"
+    ? v.split(",").map(s => s.trim()).filter(s => s && s.length <= SKILL_MAX_LEN).slice(0, SKILLS_MAX_COUNT)
+    : [];
+
+const queryOption = (v, options) => (typeof v === "string" && options.includes(v) ? v : "");
+
+// Cada pedido lee todos los CVs y consulta Firebase: se limita por cuenta
+const usersDatabaseLimiter = rateLimit({
+  windowMs:        60 * 1000,
+  max:             60,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  keyGenerator:    (req) => req.user?.uid || "anon",
+  message:         { message: "Demasiadas búsquedas seguidas. Esperá un minuto." },
+});
 
 // ─── Helper: arma un regex tolerante a acentos y mayúsculas ──────────────────
 function buildFlexibleRegex(str) {
@@ -27,6 +58,45 @@ function flattenSkills(skills) {
     ...(skills.habilidades  || []),
     ...(skills.herramientas || []),
   ];
+}
+
+// ─── Helper: cursos externos para empresas (SOLO aprobados) ───────────────────
+// Misma regla que formatExternalCourses de cvRouter.js (duplicado a propósito,
+// igual que getCandidateValidations): las empresas ven solo los cursos que el
+// candidato aprobó, con sus skills. Nunca intentos no aprobados ni sus notas.
+// cv.externalCourses lo escribe únicamente el servidor (completionService).
+function formatApprovedExternalCourses(ext) {
+  if (!ext || typeof ext !== "object" || Array.isArray(ext)) return {};
+  const out = {};
+  for (const [partnerSlug, partner] of Object.entries(ext)) {
+    const courses = {};
+    for (const [courseSlug, c] of Object.entries(partner?.courses || {})) {
+      if (!c || c.approved !== true) continue;
+      courses[courseSlug] = {
+        courseId:   c.courseId || null,
+        title:      c.title    || courseSlug,
+        approved:   true,
+        score:      typeof c.score === "number" ? c.score : null,
+        approvedAt: c.approvedAt || null,
+        skills:     c.skills && typeof c.skills === "object" && !Array.isArray(c.skills) ? c.skills : {},
+      };
+    }
+    if (Object.keys(courses).length) out[partnerSlug] = { partnerName: partner?.partnerName || partnerSlug, courses };
+  }
+  return out;
+}
+
+// Todas las skills de los cursos externos aprobados, en una lista plana
+function externalCourseSkills(formatted) {
+  const out = [];
+  for (const partner of Object.values(formatted)) {
+    for (const course of Object.values(partner.courses)) {
+      for (const list of Object.values(course.skills)) {
+        if (Array.isArray(list)) out.push(...list.filter(s => typeof s === "string"));
+      }
+    }
+  }
+  return out;
 }
 
 // ─── Helper: lee de Firebase las validaciones de Hidden para varios uids ──────
@@ -65,17 +135,18 @@ async function getClaimsValidationsMap(userIds) {
 }
 
 // ─── GET /api/users-database ───────────────────────────────────────────────────
-usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req, res) => {
+usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, usersDatabaseLimiter, async (req, res) => {
   try {
-    const page  = Math.max(1, parseInt(req.query.page)  || 1);
-    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 15));
+    const page  = Math.max(1, parseInt(queryString(req.query.page, 6))  || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(queryString(req.query.limit, 3)) || 15));
 
-    const search          = (req.query.search || "").trim();
-    const declaredSkills  = req.query.declaredSkills  ? req.query.declaredSkills.split(",").filter(Boolean)  : [];
-    const certifiedSkills = req.query.certifiedSkills ? req.query.certifiedSkills.split(",").filter(Boolean) : [];
+    // Solo strings: un array o un objeto con $ en la query se ignora
+    const search          = queryString(req.query.search, SEARCH_MAX_LEN);
+    const declaredSkills  = queryList(req.query.declaredSkills);
+    const certifiedSkills = queryList(req.query.certifiedSkills);
     const certifiedOnly   = req.query.certifiedOnly === "true";
-    const availability    = req.query.availability || "";
-    const modality        = req.query.modality || "";
+    const availability    = queryOption(req.query.availability, AVAILABILITY_OPTIONS);
+    const modality        = queryOption(req.query.modality, MODALITY_OPTIONS);
 
     const mongoFilter = {};
 
@@ -135,6 +206,7 @@ usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req,
       // ahora son las skills de TODOS los cursos completados según la claim.
       const modernSocSkills         = v?.courseSkills     || [];
       const completedCourses        = v?.completedCourses || [];
+      const externalCourses         = formatApprovedExternalCourses(cv.externalCourses);
       return {
         id:                      cv.userId,
         personalInfo:            cv.personalInfo,
@@ -150,6 +222,7 @@ usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req,
         skillsCertifiedByHidden,
         modernSocSkills,
         completedCourses,
+        externalCourses,
         userCertificated:        skillsCertifiedByHidden.length > 0,
       };
     });
@@ -181,8 +254,10 @@ usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req,
         const declaredFlat = flattenSkills(c.skills);
         const matchesDeclared = declaredFlat.some(s => searchRegex.test(s));
         const matchesCourse   = (c.modernSocSkills || []).some(s => searchRegex.test(s));
+        // Skills de cursos externos aprobados (también se ven en celeste en el front)
+        const matchesExternal = externalCourseSkills(c.externalCourses).some(s => searchRegex.test(s));
 
-        return matchesBasicFields || matchesDeclared || matchesCourse;
+        return matchesBasicFields || matchesDeclared || matchesCourse || matchesExternal;
       });
     }
 
@@ -213,7 +288,7 @@ usersDatabaseRouter.get("/api/users-database", enterpriseMiddleware, async (req,
 });
 
 // ─── GET /api/users-database/skills-summary ────────────────────────────────────
-usersDatabaseRouter.get("/api/users-database/skills-summary", enterpriseMiddleware, async (req, res) => {
+usersDatabaseRouter.get("/api/users-database/skills-summary", enterpriseMiddleware, usersDatabaseLimiter, async (req, res) => {
   try {
     const allCVs = await CV.find({}, { userId: 1, skills: 1 }).lean();
 

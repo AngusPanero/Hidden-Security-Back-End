@@ -10,6 +10,8 @@ const { EVENT_TYPES } = require("./constants/eventTypes");
 const { ACCESS_TYPES } = require("./constants/accessTypes");
 const pool = require("./services/partnerPoolService");
 const courseDurations = require("./services/courseDurationService");
+// ⚠️ Ajustá la ruta si signPin.js está en otro lugar (desde externalCourses/_core/)
+const { verifyPin, PIN_REGEX } = require("../../utils/signPin");
 
 // ─────────────────────────────────────────────────────────────────────
 // Partner Pool — rutas de administración (solo claim admin = true).
@@ -35,10 +37,11 @@ const courseDurations = require("./services/courseDurationService");
 //   GET  /api/external-courses/admin/partner-pool/durations
 //   GET  /api/external-courses/admin/partner-pool/durations/:courseId/:version
 //   POST /api/external-courses/admin/partner-pool/durations/:courseId/:version/measure          volver a medir
-//   POST /api/external-courses/admin/partner-pool/durations/:courseId/:version/approve          body: { hours?, justification? }
+//   POST /api/external-courses/admin/partner-pool/durations/:courseId/:version/approve          body: { hours?, justification?, signPin }
 //   POST /api/external-courses/admin/partner-pool/durations/:courseId/:version/reject           body: { reason }
-//   POST /api/external-courses/admin/partner-pool/durations/:courseId/:version/inherit          body: { reason }
-//   POST /api/external-courses/admin/partner-pool/durations/:courseId/:version/confirm-content  body: { reason }
+//   POST /api/external-courses/admin/partner-pool/durations/:courseId/:version/inherit          body: { reason, signPin }
+//   POST /api/external-courses/admin/partner-pool/durations/:courseId/:version/confirm-content  body: { reason, signPin }
+//   Las tres rutas que dejan una duración APROBADA (la que mueve plata) piden la clave de firma.
 //
 // Vista del partner (claim partner = true; la empresa sale del email de la sesión)
 //   GET  /api/external-courses/partner/partner-pool/settlements
@@ -352,6 +355,43 @@ const measureLimiter = rateLimit({
     message: { error: "Demasiadas mediciones seguidas. Probá de nuevo en un rato." },
 });
 
+// ── Clave de firma (signPin) ─────────────────────────────────────────
+// Aprobar, heredar o confirmar una duración define cuánto cobra cada empresa,
+// así que pide la clave de 4 dígitos además de la sesión de admin.
+// Son solo 10.000 combinaciones: tras 5 claves incorrectas en 15 minutos se
+// bloquea a ese admin (los intentos correctos no cuentan).
+const signPinLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 5,
+    skipSuccessfulRequests: true,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => req.user?.uid || "anon",
+    message: { error: "Demasiados intentos con la clave de firma. Esperá 15 minutos." },
+});
+
+async function requireSignPin(req, res, next) {
+    const pin = req.body?.signPin;
+    if (typeof pin !== "string" || !PIN_REGEX.test(pin)) {
+        return res.status(400).json({ error: "Ingresá tu clave de firma de 4 dígitos" });
+    }
+    let ok = false;
+    try {
+        ok = await verifyPin(pin);
+    } catch (err) {
+        // Falta ADMIN_SIGN_PEPPER o ADMIN_SIGN_PIN_HASH en el .env (nunca se loguea la clave)
+        console.error("[partnerPool] clave de firma no configurada:", err.message);
+        return res.status(500).json({ error: "La firma no está configurada en el servidor" });
+    }
+    // 403 y no 401: un 401 haría que el front cierre la sesión del admin
+    if (!ok) return res.status(403).json({ error: "Clave de firma incorrecta" });
+    delete req.body.signPin; // no sigue viajando ni se guarda en ningún lado
+    req.signedWithPin = true;
+    next();
+}
+
+const signedAdminOf = (req) => ({ ...adminOf(req), signedWithPin: req.signedWithPin === true });
+
 partnerPoolRouter.get(
     `${ADMIN_BASE}/durations`,
     wrap(async (req, res) => {
@@ -376,9 +416,11 @@ partnerPoolRouter.post(
 
 partnerPoolRouter.post(
     `${ADMIN_BASE}/durations/:courseId/:version/approve`,
+    signPinLimiter,
+    requireSignPin,
     wrap(async (req, res) => {
         const { hours, justification } = req.body || {};
-        res.json(await courseDurations.approve(req.params.courseId, req.params.version, { hours, justification }, adminOf(req)));
+        res.json(await courseDurations.approve(req.params.courseId, req.params.version, { hours, justification }, signedAdminOf(req)));
     })
 );
 
@@ -391,15 +433,19 @@ partnerPoolRouter.post(
 
 partnerPoolRouter.post(
     `${ADMIN_BASE}/durations/:courseId/:version/inherit`,
+    signPinLimiter,
+    requireSignPin,
     wrap(async (req, res) => {
-        res.json(await courseDurations.inheritPrevious(req.params.courseId, req.params.version, req.body?.reason, adminOf(req)));
+        res.json(await courseDurations.inheritPrevious(req.params.courseId, req.params.version, req.body?.reason, signedAdminOf(req)));
     })
 );
 
 partnerPoolRouter.post(
     `${ADMIN_BASE}/durations/:courseId/:version/confirm-content`,
+    signPinLimiter,
+    requireSignPin,
     wrap(async (req, res) => {
-        res.json(await courseDurations.confirmContent(req.params.courseId, req.params.version, req.body?.reason, adminOf(req)));
+        res.json(await courseDurations.confirmContent(req.params.courseId, req.params.version, req.body?.reason, signedAdminOf(req)));
     })
 );
 
