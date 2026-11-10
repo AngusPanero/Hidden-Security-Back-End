@@ -1,4 +1,5 @@
 const express = require("express");
+const rateLimit = require("express-rate-limit");
 
 const { getCatalog, getCourseById } = require("./registry/courseRegistry");
 const auth = require("./middleware/auth");
@@ -8,6 +9,7 @@ const CourseProgressEvent = require("./schemas/CourseProgressEventSchema");
 const { EVENT_TYPES } = require("./constants/eventTypes");
 const { ACCESS_TYPES } = require("./constants/accessTypes");
 const pool = require("./services/partnerPoolService");
+const courseDurations = require("./services/courseDurationService");
 
 // ─────────────────────────────────────────────────────────────────────
 // Partner Pool — rutas de administración (solo claim admin = true).
@@ -28,6 +30,18 @@ const pool = require("./services/partnerPoolService");
 //   POST /api/external-courses/admin/partner-pool/settlements/:settlementId/adjustments  body: { type, amount, reason }
 //   POST /api/external-courses/admin/partner-pool/settlements/:settlementId/pay          body: { paymentReference }
 //   POST /api/external-courses/admin/partner-pool/settlements/:settlementId/cancel       body: { reason }
+//
+// Duración formativa por versión (V1.2, sin IA: la estima el código y la aprueba Hidden)
+//   GET  /api/external-courses/admin/partner-pool/durations
+//   GET  /api/external-courses/admin/partner-pool/durations/:courseId/:version
+//   POST /api/external-courses/admin/partner-pool/durations/:courseId/:version/measure          volver a medir
+//   POST /api/external-courses/admin/partner-pool/durations/:courseId/:version/approve          body: { hours?, justification? }
+//   POST /api/external-courses/admin/partner-pool/durations/:courseId/:version/reject           body: { reason }
+//   POST /api/external-courses/admin/partner-pool/durations/:courseId/:version/inherit          body: { reason }
+//   POST /api/external-courses/admin/partner-pool/durations/:courseId/:version/confirm-content  body: { reason }
+//
+// Vista del partner (claim partner = true; la empresa sale del email de la sesión)
+//   GET  /api/external-courses/partner/partner-pool/settlements
 // ─────────────────────────────────────────────────────────────────────
 
 const ADMIN_BASE = "/api/external-courses/admin/partner-pool";
@@ -46,6 +60,17 @@ partnerPoolRouter.use(ADMIN_BASE, auth, requireAdmin, (req, res, next) => {
     res.set("Cache-Control", "private, no-store");
     next();
 });
+
+// ── Vista del partner: solo sus propias liquidaciones ────────────────
+const PARTNER_BASE = "/api/external-courses/partner/partner-pool";
+partnerPoolRouter.get(
+    `${PARTNER_BASE}/settlements`,
+    auth,
+    wrap(async (req, res) => {
+        res.set("Cache-Control", "private, no-store");
+        res.json(await pool.getPartnerSettlements(req.user));
+    })
+);
 
 // ══════════════════════════════════════════════════════════════════════
 //  Métricas en vivo (no liquidan nada, sirven para seguir el mes en curso)
@@ -139,7 +164,8 @@ partnerPoolRouter.get(
                     s.started += row.count;
                     break;
                 case EVENT_TYPES.STEP_COMPLETED: {
-                    const weight = getCourseById(row._id.courseId)?.partnerPool?.courseWeight ?? 1;
+                    // V1.2: no hay peso fijo por curso; la ponderación por duración se aplica al liquidar
+                    const weight = 1;
                     s.stepsCompleted += row.count;
                     s.eligibleSteps += row.eligible;
                     s.weightedUnits += row.eligible * weight;
@@ -311,6 +337,70 @@ partnerPoolRouter.post(
 partnerPoolRouter.post(
     `${ADMIN_BASE}/settlements/:settlementId/cancel`,
     settlementAction((req) => pool.cancelSettlement(req.params.settlementId, req.body?.reason, adminOf(req)))
+);
+
+// ══════════════════════════════════════════════════════════════════════
+//  Duración formativa por versión (V1.2)
+// ══════════════════════════════════════════════════════════════════════
+// Medir lee todos los PDFs y consulta los videos: límite por admin
+const measureLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => req.user?.uid || "anon",
+    message: { error: "Demasiadas mediciones seguidas. Probá de nuevo en un rato." },
+});
+
+partnerPoolRouter.get(
+    `${ADMIN_BASE}/durations`,
+    wrap(async (req, res) => {
+        res.json({ durations: await courseDurations.list(), rules: courseDurations.ESTIMATION_RULES });
+    })
+);
+
+partnerPoolRouter.get(
+    `${ADMIN_BASE}/durations/:courseId/:version`,
+    wrap(async (req, res) => {
+        res.json(await courseDurations.getDetail(req.params.courseId, req.params.version));
+    })
+);
+
+partnerPoolRouter.post(
+    `${ADMIN_BASE}/durations/:courseId/:version/measure`,
+    measureLimiter,
+    wrap(async (req, res) => {
+        res.json(await courseDurations.requestMeasurement(req.params.courseId, req.params.version, adminOf(req)));
+    })
+);
+
+partnerPoolRouter.post(
+    `${ADMIN_BASE}/durations/:courseId/:version/approve`,
+    wrap(async (req, res) => {
+        const { hours, justification } = req.body || {};
+        res.json(await courseDurations.approve(req.params.courseId, req.params.version, { hours, justification }, adminOf(req)));
+    })
+);
+
+partnerPoolRouter.post(
+    `${ADMIN_BASE}/durations/:courseId/:version/reject`,
+    wrap(async (req, res) => {
+        res.json(await courseDurations.reject(req.params.courseId, req.params.version, req.body?.reason, adminOf(req)));
+    })
+);
+
+partnerPoolRouter.post(
+    `${ADMIN_BASE}/durations/:courseId/:version/inherit`,
+    wrap(async (req, res) => {
+        res.json(await courseDurations.inheritPrevious(req.params.courseId, req.params.version, req.body?.reason, adminOf(req)));
+    })
+);
+
+partnerPoolRouter.post(
+    `${ADMIN_BASE}/durations/:courseId/:version/confirm-content`,
+    wrap(async (req, res) => {
+        res.json(await courseDurations.confirmContent(req.params.courseId, req.params.version, req.body?.reason, adminOf(req)));
+    })
 );
 
 module.exports = partnerPoolRouter;

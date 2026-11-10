@@ -3,6 +3,7 @@ const path = require("path");
 const Partner = require("../schemas/PartnerSchema");
 const { validatePartnerConfig, validateCourseConfig, validateSkillsTree } = require("./validateConfig");
 const { syncCourseVersion } = require("./syncCourseVersions");
+const courseDurations = require("../services/courseDurationService");
 const { STEP_TYPES, QUIZ_STEP_TYPES, MIN_PASS_SCORE } = require("../constants/stepTypes");
 
 // ─────────────────────────────────────────────────────────────────────
@@ -246,7 +247,16 @@ async function loadCourse({ partner, partnerFolder, courseFolder, courseDir }) {
     const course = buildRuntimeCourse({ config, quizzes, partner, contentDir, skills });
 
     // Solo los cursos publicados quedan congelados. DRAFT se puede seguir editando.
-    if (course.status === "ACTIVE") await syncCourseVersion(course);
+    if (course.status === "ACTIVE") {
+        await syncCourseVersion(course);
+        // Duración formativa de la versión (Partner Pool V1.2): se registra y se mide
+        // en segundo plano. Un error acá nunca impide cargar el curso.
+        try {
+            await courseDurations.registerVersion(course);
+        } catch (err) {
+            console.error(`[externalCourses] no se pudo registrar la duración de ${course.courseId} v${course.version}:`, err.message);
+        }
+    }
 
     return course;
 }
@@ -307,6 +317,8 @@ async function loadCourses() {
         }
     }
 
+    await courseDurations.refreshPublishable();
+
     console.log(`[externalCourses] cursos cargados: ${loaded.length}`);
     loaded.forEach((l) => console.log(`  ✓ ${l}`));
     skipped.forEach((s) => console.error(`  ✗ ${s.path}: ${s.reason}`));
@@ -323,9 +335,11 @@ function getCourseById(courseId) {
     return coursesById.get(courseId) || null;
 }
 
+// Catálogo público: solo cursos ACTIVE que ya tienen una duración formativa
+// aprobada por Hidden (V1.2: un curso no se publica sin esa revisión).
 function getCatalog() {
     return [...coursesByKey.values()]
-        .filter((c) => c.status === "ACTIVE")
+        .filter((c) => c.status === "ACTIVE" && courseDurations.isPublishable(c.courseId))
         .map((c) => c.catalogEntry);
 }
 

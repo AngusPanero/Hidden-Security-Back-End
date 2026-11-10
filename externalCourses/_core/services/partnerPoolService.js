@@ -13,12 +13,19 @@ const { ACCESS_TYPES } = require("../constants/accessTypes");
 const { httpError } = require("../utils/httpError");
 const { runInTransaction } = require("../utils/db");
 const { computeRevenue, hadEligiblePlan } = require("./partnerPoolRevenue");
+const courseDurations = require("./courseDurationService");
 
 // ══════════════════════════════════════════════════════════════════════
-//  Partner Pool V1 — cálculo mensual, liquidaciones, ajustes y auditoría
-//  (Especificación funcional y técnica V1, secciones 16 a 26)
+//  Partner Pool V1.2 — cálculo mensual, liquidaciones, ajustes y auditoría
+//  (Especificación V1 + documento V1.2: ponderación dinámica por duración)
+//
+//  Separación obligatoria (V1.2, sección 6):
+//   - PUNTOS BASE      → consumo y habilitación del fondo (nunca se ponderan)
+//   - PUNTOS PONDERADOS → solo para repartir el fondo YA habilitado entre partners
+//  La duración nunca agranda el fondo ni genera puntos base.
 // ══════════════════════════════════════════════════════════════════════
 
+const FORMULA_VERSION = "PP_V1.2";
 const Decimal128 = mongoose.Types.Decimal128;
 const EXCLUDED_ACCESS = new Set([ACCESS_TYPES.ADMIN, ACCESS_TYPES.TEST]);
 
@@ -143,7 +150,9 @@ async function audit({ action, admin, period = null, settlementId = null, partne
 //  completionScore = completionWeight (0,30) si COURSE_COMPLETED ocurrió en el período
 //  totalScore      = progressScore + completionScore, con tope acumulado de 1 por
 //                    usuario + curso + versión (sumando períodos anteriores)
-//  weightedScore   = totalScore × courseWeight  → suma al curso y al Partner
+//                    = PUNTOS BASE. Acá no se pondera nada: la ponderación por
+//                    duración se aplica después, una sola vez por curso
+//                    (computeDurationWeighting).
 //
 //  Un avance suma solo si, en el momento en que ocurrió:
 //   - lo hizo un alumno (admin, partner y enterprise nunca suman; ADMIN/TEST tampoco)
@@ -159,7 +168,6 @@ const courseKeyOf = (courseId, version) => `${courseId}|${version}`;
 function computeConsumption({ events, versions, partners, previousScores, config, eligibility = null }) {
     const progressWeight = Number(config.progressWeight);
     const completionWeight = Number(config.completionWeight);
-    const defaultCourseWeight = Number(config.defaultCourseWeight ?? 1);
 
     const versionMap = new Map(versions.map((v) => [courseKeyOf(v.courseId, v.version), v]));
     const eligibleSteps = new Map(
@@ -274,8 +282,6 @@ function computeConsumption({ events, versions, partners, previousScores, config
         const totalScore = Math.min(rawScore, allowed);
         const cappedBy = rawScore - totalScore;
 
-        const courseWeight = v.partnerPool?.courseWeight ?? defaultCourseWeight;
-
         snapshots.push({
             userId: u.userId,
             courseId: u.courseId,
@@ -287,7 +293,7 @@ function computeConsumption({ events, versions, partners, previousScores, config
                 totalEligibleSteps: totalEligible,
                 estimatedDurationMinutes: v.estimatedDurationMinutes ?? null,
                 moduleCount: v.moduleCount ?? 0,
-                courseWeight,
+                courseWeight: 1, // V1.2: sin peso fijo por curso (campo histórico)
             },
             consumption: {
                 newCompletedSteps: newSteps,
@@ -297,7 +303,7 @@ function computeConsumption({ events, versions, partners, previousScores, config
                 completionScore,
                 totalScore,
                 cappedBy: cappedBy > 1e-12 ? cappedBy : null,
-                weightedScore: totalScore * courseWeight,
+                weightedScore: totalScore, // campo histórico: = puntos base
             },
         });
     }
@@ -324,10 +330,10 @@ function computeConsumption({ events, versions, partners, previousScores, config
 
     for (const s of snapshots) {
         const c = ensureCourse(s.partnerId, s.courseId, s.courseVersion, s.courseSnapshot.title);
-        c.consumptionScore += s.consumption.weightedScore;
+        c.consumptionScore += s.consumption.totalScore; // puntos BASE del curso
         if (s.consumption.totalScore > 0) c.uniqueConsumers++;
         if (s.consumption.completedDuringPeriod) c.completions++;
-        partnerAgg.get(s.partnerId).score += s.consumption.weightedScore;
+        partnerAgg.get(s.partnerId).score += s.consumption.totalScore;
     }
 
     for (const [cKey, count] of enrollments) {
@@ -339,18 +345,17 @@ function computeConsumption({ events, versions, partners, previousScores, config
     const globalScore = [...partnerAgg.values()].reduce((acc, p) => acc + p.score, 0);
     const uniqueConsumers = new Set(snapshots.filter((s) => s.consumption.totalScore > 0).map((s) => s.userId));
     const participatingCourses = new Set(
-        snapshots.filter((s) => s.consumption.weightedScore > 0).map((s) => courseKeyOf(s.courseId, s.courseVersion))
+        snapshots.filter((s) => s.consumption.totalScore > 0).map((s) => courseKeyOf(s.courseId, s.courseVersion))
     );
 
     return {
         snapshots,
         partners: [...partnerAgg.entries()].map(([partnerId, pa]) => ({
             partnerId,
-            partnerScore: pa.score,
-            partnerShare: globalScore ? pa.score / globalScore : 0,
+            partnerBaseScore: pa.score,
             courses: [...pa.courses.values()],
         })),
-        globalScore,
+        globalScore, // suma de PUNTOS BASE: es lo único que habilita el fondo
         metrics: {
             uniqueEligibleConsumers: uniqueConsumers.size,
             participatingCourses: participatingCourses.size,
@@ -364,6 +369,108 @@ function computeConsumption({ events, versions, partners, previousScores, config
             bannedPartnerEvents: warnings.bannedPartnerEvents,
             noPaidPlanEvents: warnings.noPaidPlanEvents,
         },
+    };
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  PONDERACIÓN DINÁMICA POR DURACIÓN (V1.2, secciones 3 a 5)
+//
+//  - Participan los cursos (versión) con puntos base > 0 en el período.
+//  - Referencia del mes (100%) = mayor duración APROBADA entre esos cursos.
+//    Un curso sin consumo no mueve la referencia. Empates → todos 100%.
+//  - % del curso = horas del curso / horas de referencia (sin redondear)
+//  - Puntos ponderados = puntos base del curso × %   (una sola vez, por curso)
+//  - Participación del partner = sus ponderados / ponderados totales
+//  - Un curso con puntos y SIN duración aprobada no recibe % automático:
+//    el período queda "requiere revisión" y no se puede aprobar.
+// ══════════════════════════════════════════════════════════════════════
+function computeDurationWeighting({ partners, durations }) {
+    const EPS = 1e-9;
+    const missingDurations = [];
+    const all = [];
+
+    for (const p of partners) {
+        for (const c of p.courses) {
+            if (!(c.consumptionScore > 0)) continue;
+            const d = durations.get(courseKeyOf(c.courseId, c.courseVersion));
+            const hours = d?.hours ?? null;
+            if (hours == null) {
+                missingDurations.push({
+                    courseId: c.courseId,
+                    courseVersion: c.courseVersion,
+                    title: c.title,
+                    partnerId: p.partnerId,
+                    reason: !d ? "SIN_REGISTRO" : d.contentChanged ? "CONTENIDO_CAMBIADO" : d.status,
+                });
+            }
+            all.push({ partnerId: p.partnerId, course: c, hours, recordId: d?.recordId ?? null });
+        }
+    }
+
+    const withHours = all.filter((x) => x.hours != null && x.hours > 0);
+    const referenceHours = withHours.length ? Math.max(...withHours.map((x) => x.hours)) : null;
+
+    const weightOf = new Map(); // courseKey → { approvedHours, weightPct, weightedScore, durationRecordId }
+    for (const x of all) {
+        const weightPct = x.hours != null && referenceHours ? x.hours / referenceHours : 0;
+        weightOf.set(courseKeyOf(x.course.courseId, x.course.courseVersion), {
+            approvedHours: x.hours,
+            weightPct: x.hours != null ? weightPct : null,
+            weightedScore: x.course.consumptionScore * weightPct,
+            durationRecordId: x.recordId,
+        });
+    }
+
+    const outPartners = partners.map((p) => {
+        const courses = p.courses.map((c) => {
+            const w = weightOf.get(courseKeyOf(c.courseId, c.courseVersion));
+            return {
+                ...c,
+                approvedHours: w ? w.approvedHours : null,
+                weightPct: w ? w.weightPct : null,
+                weightedScore: w ? w.weightedScore : 0,
+                durationRecordId: w ? w.durationRecordId : null,
+            };
+        });
+        return {
+            partnerId: p.partnerId,
+            partnerBaseScore: p.partnerBaseScore,
+            partnerWeightedScore: courses.reduce((acc, c) => acc + c.weightedScore, 0),
+            courses,
+        };
+    });
+
+    const totalBaseScore = outPartners.reduce((acc, p) => acc + p.partnerBaseScore, 0);
+    const totalWeightedScore = outPartners.reduce((acc, p) => acc + p.partnerWeightedScore, 0);
+    for (const p of outPartners) {
+        p.partnerShare = totalWeightedScore > 0 ? p.partnerWeightedScore / totalWeightedScore : 0;
+    }
+
+    const courseRows = all.map((x) => {
+        const w = weightOf.get(courseKeyOf(x.course.courseId, x.course.courseVersion));
+        return {
+            courseId: x.course.courseId,
+            courseVersion: x.course.courseVersion,
+            title: x.course.title,
+            partnerId: x.partnerId,
+            approvedHours: x.hours,
+            durationRecordId: x.recordId,
+            weightPct: w.weightPct,
+            baseScore: x.course.consumptionScore,
+            weightedScore: w.weightedScore,
+            isReference: referenceHours != null && x.hours != null && Math.abs(x.hours - referenceHours) < EPS,
+        };
+    });
+
+    return {
+        referenceHours,
+        referenceCourses: courseRows.filter((c) => c.isReference),
+        courses: courseRows,
+        partners: outPartners,
+        totalBaseScore,
+        totalWeightedScore,
+        requiresReview: missingDurations.length > 0,
+        missingDurations,
     };
 }
 
@@ -476,12 +583,24 @@ async function calculatePeriod(periodInput, admin) {
             config,
             eligibility: { windowsByUser: revenue.windowsByUser, staffUserIds: revenue.staffUserIds },
         });
+        // La habilitación del fondo usa SOLO puntos base (V1.2, sección 6)
         const fin = computeFinancials({
             revenue: revenue.eligibleNetTrainingRevenue,
             eligibleSubscriptions: revenue.eligibleSubscriptions,
             totalConsumptionScore: result.globalScore,
             config,
         });
+
+        // Ponderación por duración: se usa la duración APROBADA de la versión que
+        // generó los puntos (no la del curso actual)
+        const pairsWithPoints = [];
+        for (const p of result.partners) {
+            for (const c of p.courses) {
+                if (c.consumptionScore > 0) pairsWithPoints.push({ courseId: c.courseId, version: c.courseVersion });
+            }
+        }
+        const durations = await courseDurations.getDurationsFor(pairsWithPoints);
+        const weighting = computeDurationWeighting({ partners: result.partners, durations });
 
         const now = new Date();
         const partnerMap = new Map(partners.map((p) => [String(p._id), p]));
@@ -509,7 +628,7 @@ async function calculatePeriod(periodInput, admin) {
                             cappedBy: s.consumption.cappedBy == null ? null : toDec(s.consumption.cappedBy),
                             weightedScore: toDec(s.consumption.weightedScore),
                         },
-                        formulaVersion: config.formulaVersion,
+                        formulaVersion: FORMULA_VERSION,
                         calculatedAt: now,
                     })),
                     { session }
@@ -519,11 +638,17 @@ async function calculatePeriod(periodInput, admin) {
             // Liquidaciones: se actualizan conservando ajustes y cancelaciones
             const existing = await PartnerPoolSettlement.find({ period }).session(session).lean();
             const existingByPartner = new Map(existing.map((s) => [String(s.partnerId), s]));
-            const computedPartners = new Set(result.partners.map((p) => p.partnerId));
+            const computedPartners = new Set(weighting.partners.map((p) => p.partnerId));
 
-            const zeroFor = (partnerId) => ({ partnerId, partnerScore: 0, partnerShare: 0, courses: [] });
+            const zeroFor = (partnerId) => ({
+                partnerId,
+                partnerBaseScore: 0,
+                partnerWeightedScore: 0,
+                partnerShare: 0,
+                courses: [],
+            });
             const toWrite = [
-                ...result.partners.filter((p) => p.partnerScore > 0 || existingByPartner.has(p.partnerId)),
+                ...weighting.partners.filter((p) => p.partnerBaseScore > 0 || existingByPartner.has(p.partnerId)),
                 ...[...existingByPartner.keys()].filter((id) => !computedPartners.has(id)).map(zeroFor),
             ];
 
@@ -544,11 +669,26 @@ async function calculatePeriod(periodInput, admin) {
                                 name: partner?.name || "",
                                 email: partner?.email || "",
                             },
-                            formulaVersion: config.formulaVersion,
-                            courses: p.courses.map((c) => ({ ...c, consumptionScore: toDec(c.consumptionScore) })),
-                            partnerScore: toDec(p.partnerScore),
-                            globalScore: toDec(result.globalScore),
+                            formulaVersion: FORMULA_VERSION,
+                            courses: p.courses.map((c) => ({
+                                courseId: c.courseId,
+                                courseVersion: c.courseVersion,
+                                title: c.title,
+                                enrollments: c.enrollments,
+                                uniqueConsumers: c.uniqueConsumers,
+                                completions: c.completions,
+                                consumptionScore: toDec(c.consumptionScore), // puntos base
+                                approvedHours: c.approvedHours == null ? null : toDec(c.approvedHours, 2),
+                                weightPct: c.weightPct == null ? null : toDec(c.weightPct),
+                                weightedScore: toDec(c.weightedScore || 0),
+                                durationRecordId: c.durationRecordId || null,
+                            })),
+                            partnerBaseScore: toDec(p.partnerBaseScore),
+                            partnerScore: toDec(p.partnerWeightedScore), // ponderados: definen la participación
+                            globalBaseScore: toDec(weighting.totalBaseScore),
+                            globalScore: toDec(weighting.totalWeightedScore),
                             partnerShare: toDec(p.partnerShare),
+                            referenceHours: weighting.referenceHours == null ? null : toDec(weighting.referenceHours, 2),
                             enabledPoolAmount: toMoney(fin.enabledPoolAmount),
                             settlementAmount,
                             finalAmount,
@@ -568,8 +708,39 @@ async function calculatePeriod(periodInput, admin) {
                 {
                     $set: {
                         status: "CALCULATED",
-                        formulaVersion: config.formulaVersion,
+                        formulaVersion: FORMULA_VERSION,
                         range: { from, to },
+                        // Copia inalterable de la referencia y los porcentajes usados (V1.2, sección 7)
+                        durationWeighting: {
+                            referenceHours: weighting.referenceHours == null ? null : toDec(weighting.referenceHours, 2),
+                            referenceCourses: weighting.referenceCourses.map((c) => ({
+                                courseId: c.courseId,
+                                courseVersion: c.courseVersion,
+                                title: c.title,
+                                partnerId: c.partnerId,
+                                partnerName: partnerMap.get(c.partnerId)?.name || "",
+                            })),
+                            courses: weighting.courses.map((c) => ({
+                                courseId: c.courseId,
+                                courseVersion: c.courseVersion,
+                                title: c.title,
+                                partnerId: c.partnerId,
+                                partnerName: partnerMap.get(c.partnerId)?.name || "",
+                                approvedHours: c.approvedHours == null ? null : toDec(c.approvedHours, 2),
+                                durationRecordId: c.durationRecordId,
+                                weightPct: c.weightPct == null ? null : toDec(c.weightPct),
+                                baseScore: toDec(c.baseScore),
+                                weightedScore: toDec(c.weightedScore),
+                                isReference: c.isReference,
+                            })),
+                            totalBaseScore: toDec(weighting.totalBaseScore),
+                            totalWeightedScore: toDec(weighting.totalWeightedScore),
+                            requiresReview: weighting.requiresReview,
+                            missingDurations: weighting.missingDurations.map((m) => ({
+                                ...m,
+                                partnerName: partnerMap.get(m.partnerId)?.name || "",
+                            })),
+                        },
                         configuration: {
                             maximumPoolRate: toDec(config.maximumPoolRate),
                             progressWeight: toDec(config.progressWeight),
@@ -626,13 +797,16 @@ async function calculatePeriod(periodInput, admin) {
                     events: events.length,
                     snapshots: result.snapshots.length,
                     globalScore: result.globalScore,
+                    totalWeightedScore: weighting.totalWeightedScore,
+                    referenceHours: weighting.referenceHours,
+                    requiresReview: weighting.requiresReview,
                     enabledPoolAmount: fin.enabledPoolAmount,
                     warnings: result.warnings,
                 },
             });
         });
 
-        return { warnings: result.warnings };
+        return { warnings: { ...result.warnings, missingDurations: weighting.missingDurations } };
     } catch (err) {
         // Si algo falló, el período vuelve al estado anterior
         await PartnerPoolPeriod.updateOne({ period, status: "CALCULATING" }, { $set: { status: previousStatus } });
@@ -644,12 +818,22 @@ async function approvePeriod(periodInput, admin) {
     const { period } = parsePeriod(periodInput);
     await runInTransaction(async (session) => {
         const now = new Date();
+        // V1.2: no se aprueba si hay cursos con puntos y sin duración aprobada
         const updated = await PartnerPoolPeriod.findOneAndUpdate(
-            { period, status: "CALCULATED" },
+            { period, status: "CALCULATED", "durationWeighting.requiresReview": { $ne: true } },
             { $set: { status: "APPROVED", approvedAt: now, approvedBy: admin.uid } },
             { session, returnDocument: "after" }
         ).lean();
-        if (!updated) throw httpError(409, "Solo se aprueba un período calculado");
+        if (!updated) {
+            const current = await PartnerPoolPeriod.findOne({ period }).session(session).lean();
+            if (current?.status === "CALCULATED" && current?.durationWeighting?.requiresReview) {
+                throw httpError(
+                    409,
+                    "Hay cursos con consumo y sin duración aprobada. Aprobá sus duraciones en la pestaña Duraciones y recalculá el período."
+                );
+            }
+            throw httpError(409, "Solo se aprueba un período calculado");
+        }
 
         await PartnerPoolSettlement.updateMany(
             { period, status: "CALCULATED" },
@@ -834,6 +1018,58 @@ async function cancelSettlement(settlementId, reason, admin) {
     });
 }
 
+// ─── Vista del partner: SOLO sus liquidaciones ───────────────────────
+// La empresa sale del email verificado de la sesión (cuenta partner de
+// Firebase = email de partner.config.js), nunca de un parámetro: así nadie
+// puede ver la liquidación de otra empresa cambiando un ID.
+// Solo se muestran liquidaciones aprobadas o pagadas (las calculadas todavía
+// pueden cambiar) y nunca datos de otras empresas.
+async function getPartnerSettlements(user) {
+    const email = String(user?.email || "").trim().toLowerCase();
+    if (user?.partner !== true || !email || user?.email_verified === false) {
+        throw httpError(403, "Acceso solo para cuentas partner verificadas");
+    }
+    const partner = await Partner.findOne({ email }).lean();
+    if (!partner) throw httpError(403, "Tu cuenta no está vinculada a ninguna empresa partner");
+
+    const settlements = await PartnerPoolSettlement.find({
+        partnerId: partner._id,
+        status: { $in: ["APPROVED", "PAID"] },
+    })
+        .sort({ period: -1 })
+        .limit(36)
+        .lean();
+
+    return plain({
+        partner: { name: partner.name, code: partner.code },
+        settlements: settlements.map((s) => ({
+            settlementId: s.settlementId,
+            period: s.period,
+            status: s.status,
+            formulaVersion: s.formulaVersion,
+            referenceHours: s.referenceHours ?? null,
+            courses: (s.courses || []).map((c) => ({
+                title: c.title,
+                courseVersion: c.courseVersion,
+                approvedHours: c.approvedHours ?? null,
+                weightPct: c.weightPct ?? null,
+                baseScore: c.consumptionScore,
+                weightedScore: c.weightedScore ?? c.consumptionScore,
+                uniqueConsumers: c.uniqueConsumers,
+                completions: c.completions,
+            })),
+            partnerBaseScore: s.partnerBaseScore ?? s.partnerScore,
+            partnerWeightedScore: s.partnerScore,
+            partnerShare: s.partnerShare,
+            settlementAmount: s.settlementAmount,
+            adjustments: (s.adjustments || []).map((a) => ({ type: a.type, amount: a.amount, reason: a.reason, createdAt: a.createdAt })),
+            finalAmount: s.finalAmount,
+            approvedAt: s.approvedAt,
+            paidAt: s.paidAt,
+        })),
+    });
+}
+
 // ─── Lecturas ────────────────────────────────────────────────────────
 async function listPeriods() {
     const [periods, totals] = await Promise.all([
@@ -891,6 +1127,7 @@ module.exports = {
     markPaid,
     cancelSettlement,
     // lecturas
+    getPartnerSettlements,
     listPeriods,
     getPeriodDetail,
     getConfig,
@@ -898,6 +1135,8 @@ module.exports = {
     // puras (tests)
     computeConsumption,
     computeFinancials,
+    computeDurationWeighting,
     parsePeriod,
+    FORMULA_VERSION,
     plain,
 };

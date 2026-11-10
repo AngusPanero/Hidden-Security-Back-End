@@ -10,7 +10,7 @@ const PartnerPoolConfigSchema = new mongoose.Schema(
     {
         key: { type: String, required: true, unique: true, default: "active" },
 
-        formulaVersion: { type: String, default: "PP_V1" },
+        formulaVersion: { type: String, default: "PP_V1.2" }, // informativo: el cálculo usa FORMULA_VERSION del servicio
         maximumPoolRate: { type: Number, default: 0.2 },
         progressWeight: { type: Number, default: 0.7 },
         completionWeight: { type: Number, default: 0.3 },

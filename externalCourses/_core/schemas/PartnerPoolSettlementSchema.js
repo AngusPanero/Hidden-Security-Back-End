@@ -29,7 +29,12 @@ const SettlementCourseSchema = new mongoose.Schema(
         enrollments: { type: Number, default: 0 },
         uniqueConsumers: { type: Number, default: 0 },
         completions: { type: Number, default: 0 },
-        consumptionScore: { type: D, required: true },
+        consumptionScore: { type: D, required: true },   // puntos BASE del curso
+        // V1.2 — ponderación por duración
+        approvedHours: { type: D, default: null },
+        weightPct: { type: D, default: null },           // 0 a 1
+        weightedScore: { type: D, default: null },       // puntos base × weightPct
+        durationRecordId: { type: String, default: null },
     },
     { _id: false }
 );
@@ -48,8 +53,11 @@ const PartnerPoolSettlementSchema = new mongoose.Schema(
 
         courses: { type: [SettlementCourseSchema], default: [] },
 
-        partnerScore: { type: D, required: true },
-        globalScore: { type: D, required: true },
+        partnerBaseScore: { type: D, default: null },    // V1.2: puntos base del partner
+        partnerScore: { type: D, required: true },       // puntos ponderados del partner (definen la participación)
+        globalBaseScore: { type: D, default: null },     // V1.2: puntos base de todos los partners
+        globalScore: { type: D, required: true },        // puntos ponderados de todos los partners
+        referenceHours: { type: D, default: null },      // V1.2: referencia del mes (100%)
         partnerShare: { type: D, required: true },
         enabledPoolAmount: { type: D, required: true },
         settlementAmount: { type: D, required: true },

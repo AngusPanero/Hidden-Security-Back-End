@@ -7,11 +7,29 @@ const D = mongoose.Schema.Types.Decimal128;
 
 const PERIOD_STATUSES = ["OPEN", "CALCULATING", "CALCULATED", "APPROVED", "CLOSED"];
 
+// V1.2 — copia inalterable de la ponderación por duración usada en el cálculo
+const WeightedCourseSchema = new mongoose.Schema(
+    {
+        courseId: { type: String, required: true },
+        courseVersion: { type: Number, required: true },
+        title: { type: String, default: "" },
+        partnerId: { type: mongoose.Schema.Types.ObjectId, ref: "Partner", required: true },
+        partnerName: { type: String, default: "" },
+        approvedHours: { type: D, default: null },     // null = sin duración aprobada (requiere revisión)
+        durationRecordId: { type: String, default: null },
+        weightPct: { type: D, default: null },         // 0 a 1 (horas / horas de referencia)
+        baseScore: { type: D, required: true },
+        weightedScore: { type: D, required: true },
+        isReference: { type: Boolean, default: false },
+    },
+    { _id: false }
+);
+
 const PartnerPoolPeriodSchema = new mongoose.Schema(
     {
         period: { type: String, required: true, unique: true }, // "2026-10"
         status: { type: String, enum: PERIOD_STATUSES, default: "OPEN" },
-        formulaVersion: { type: String, default: "PP_V1" },
+        formulaVersion: { type: String, default: "PP_V1.2" },
 
         range: {
             from: { type: Date, required: true },
@@ -56,6 +74,30 @@ const PartnerPoolPeriodSchema = new mongoose.Schema(
             totalConsumptionScore: { type: D, default: null },
             consumptionTarget: { type: D, default: null },
             enablementFactor: { type: D, default: null },
+        },
+
+        durationWeighting: {
+            referenceHours: { type: D, default: null }, // la mayor duración aprobada con consumo = 100%
+            referenceCourses: {
+                type: [
+                    new mongoose.Schema(
+                        {
+                            courseId: String,
+                            courseVersion: Number,
+                            title: String,
+                            partnerId: { type: mongoose.Schema.Types.ObjectId, ref: "Partner" },
+                            partnerName: String,
+                        },
+                        { _id: false }
+                    ),
+                ],
+                default: [],
+            },
+            courses: { type: [WeightedCourseSchema], default: [] },
+            totalBaseScore: { type: D, default: null },
+            totalWeightedScore: { type: D, default: null },
+            requiresReview: { type: Boolean, default: false },
+            missingDurations: { type: [mongoose.Schema.Types.Mixed], default: [] },
         },
 
         calculatedAt: { type: Date, default: null },

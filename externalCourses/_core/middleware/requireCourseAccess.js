@@ -7,6 +7,8 @@ const {
 
 // ⚠️ Ajustá la ruta si tu config de Firebase está en otro lugar
 const auth = require("../../../config/firebase");
+const ExternalCourseProgress = require("../schemas/ExternalCourseProgressSchema");
+const courseDurations = require("../services/courseDurationService");
 
 // ─────────────────────────────────────────────────────────────────────
 // Decide si req.user puede cursar req.course y con qué tipo de acceso.
@@ -115,6 +117,18 @@ module.exports = async function requireCourseAccess(req, res, next) {
 
         if (!access.allowed) {
             return res.status(access.status).json({ error: access.message });
+        }
+
+        // V1.2: un curso sin duración formativa aprobada por Hidden no está publicado.
+        // Admin y test entran igual (para revisarlo); un alumno que ya lo había
+        // empezado tampoco pierde el acceso.
+        const staffAccess = [ACCESS_TYPES.ADMIN, ACCESS_TYPES.TEST].includes(access.accessType);
+        if (!staffAccess && !courseDurations.isPublishable(req.course.courseId)) {
+            const started = await ExternalCourseProgress.exists({
+                userId: String(req.user.uid),
+                courseId: req.course.courseId,
+            });
+            if (!started) return res.status(404).json({ error: "Curso no encontrado" });
         }
 
         const role = roleOf(req.user);

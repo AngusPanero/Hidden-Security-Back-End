@@ -13,6 +13,14 @@ const AUDIT_ACTIONS = [
     "REOPENED",
     "CANCELLED",
     "CONFIG_UPDATED",
+    // Duración formativa por versión de curso (V1.2)
+    "DURATION_MEASURED",
+    "DURATION_MEASUREMENT_REQUESTED",
+    "DURATION_APPROVED",
+    "DURATION_REJECTED",
+    "DURATION_INHERITED",
+    "DURATION_CONTENT_CHANGED",
+    "DURATION_CONTENT_CONFIRMED",
 ];
 
 const PartnerPoolAuditLogSchema = new mongoose.Schema(
