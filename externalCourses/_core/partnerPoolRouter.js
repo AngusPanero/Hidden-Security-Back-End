@@ -123,10 +123,36 @@ partnerPoolRouter.get(
                     },
                 },
             ]),
+            // Alumnos: por persona (con las empresas en las que hizo cursos) → por empresa y totales.
+            // Una persona con cursos de varias empresas cuenta en cada una, pero una sola vez en el total.
             CourseProgressEvent.aggregate([
                 { $match: { partnerId: { $ne: null }, occurredAt: { $gte: from, $lt: to }, ...realAccess } },
-                { $group: { _id: { partnerId: "$partnerId", userId: "$userId" } } },
-                { $group: { _id: "$_id.partnerId", students: { $sum: 1 } } },
+                { $group: { _id: "$userId", partners: { $addToSet: "$partnerId" } } },
+                { $addFields: { partnerCount: { $size: "$partners" } } },
+                {
+                    $facet: {
+                        byPartner: [
+                            { $unwind: "$partners" },
+                            {
+                                $group: {
+                                    _id: "$partners",
+                                    students: { $sum: 1 },
+                                    shared: { $sum: { $cond: [{ $gt: ["$partnerCount", 1] }, 1, 0] } },
+                                },
+                            },
+                        ],
+                        totals: [
+                            {
+                                $group: {
+                                    _id: null,
+                                    unique: { $sum: 1 },
+                                    multi: { $sum: { $cond: [{ $gt: ["$partnerCount", 1] }, 1, 0] } },
+                                    appearances: { $sum: "$partnerCount" },
+                                },
+                            },
+                        ],
+                    },
+                },
             ]),
             CourseProgressEvent.aggregate([
                 {
@@ -195,7 +221,9 @@ partnerPoolRouter.get(
             else s.allTimeCompleted += row.count;
         }
 
-        const studentsByPartner = new Map(studentRows.map((r) => [String(r._id), r.students]));
+        const studentFacet = studentRows[0] || { byPartner: [], totals: [] };
+        const studentsByPartner = new Map(studentFacet.byPartner.map((r) => [String(r._id), r]));
+        const studentTotals = studentFacet.totals[0] || { unique: 0, multi: 0, appearances: 0 };
 
         const result = partners.map((p) => {
             const pid = String(p._id);
@@ -232,7 +260,9 @@ partnerPoolRouter.get(
                 logoUrl: p.logoUrl || "",
                 status: p.status,
                 poolEnabled,
-                students: studentsByPartner.get(pid) || 0,
+                students: studentsByPartner.get(pid)?.students || 0,
+                // de esos alumnos, cuántos también hicieron cursos de otra empresa en el período
+                sharedStudents: studentsByPartner.get(pid)?.shared || 0,
                 started: sum("started"),
                 stepsCompleted: sum("stepsCompleted"),
                 eligibleSteps: sum("eligibleSteps"),
@@ -257,7 +287,10 @@ partnerPoolRouter.get(
             totals: {
                 partners: result.length,
                 activePartners: result.filter((p) => p.poolEnabled).length,
-                students: result.reduce((acc, p) => acc + p.students, 0),
+                students: result.reduce((acc, p) => acc + p.students, 0), // suma por empresa (repite personas)
+                uniqueStudents: studentTotals.unique,                     // personas distintas
+                multiPartnerStudents: studentTotals.multi,                // personas con cursos de más de una empresa
+                studentAppearances: studentTotals.appearances,            // = students si todas las empresas existen
                 eligibleSteps: result.reduce((acc, p) => acc + p.eligibleSteps, 0),
                 weightedUnits: totalUnits,
                 completions: result.reduce((acc, p) => acc + p.completions, 0),

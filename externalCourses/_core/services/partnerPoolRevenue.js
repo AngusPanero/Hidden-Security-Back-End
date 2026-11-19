@@ -1,4 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────
+// ORIGINAL
 // Ingresos, suscripciones y alumnos elegibles del Partner Pool,
 // sacados de la colección de pagos. ÚNICO archivo del pool que toca pagos.
 //
@@ -9,22 +10,6 @@ const Coupon = require("../../../models/CouponSchema");
 const auth = require("../../../config/firebase");
 const { PLAN_PRICES, PLAN_DURATIONS } = require("../../../routes/paymentRoutes");
 const { POOL_PLANS } = require("../constants/accessTypes");
-
-// ⚠️ SOLO PARA TESTING ─ volver a false antes de liquidar en serio.
-// En true, los planes pagados con $0 (cupón del 100%) cuentan como plan
-// elegible: el alumno suma puntos y cuenta como suscripción del mes.
-// Esos pagos valen $0, así que no agregan plata al fondo.
-// Todo lo demás sigue igual (admin, partner, enterprise, baneados, isTest).
-const TEST_COUNT_FREE_PAYMENTS = true;
-
-// ⚠️ SOLO PARA TESTING ─ volver a false antes de liquidar en serio.
-// En true, los alumnos con un plan starter/pro/elite dado a mano desde el
-// ClaimsManager (claims purchases + purchaseExpiry, sin pago guardado) cuentan
-// como plan elegible: suman puntos y cuentan como suscripción del mes, con
-// valor $0 (no agregan plata al fondo). Solo se miran los alumnos que tuvieron
-// actividad en cursos externos en el mes. Los roles de staff siguen excluidos.
-const TEST_COUNT_CLAIM_PLANS = true;
-const CourseProgressEvent = require("../schemas/CourseProgressEventSchema");
 
 // ═════════════════════════════════════════════════════════════════════
 //  REGLAS
@@ -110,7 +95,7 @@ async function buildWindows(payments, revenueConfig) {
         if (!plan) continue;
 
         const amount = Number(p.amount) || 0;
-        if (amount <= 0 && !TEST_COUNT_FREE_PAYMENTS) {
+        if (amount <= 0) {
             excludedFree++;
             continue;
         }
@@ -126,7 +111,7 @@ async function buildWindows(payments, revenueConfig) {
         }
 
         const value = Math.min(amount, baseValue * (1 - discountRate));
-        if (value <= 0 && !TEST_COUNT_FREE_PAYMENTS) {
+        if (value <= 0) {
             excludedFree++;
             continue;
         }
@@ -149,41 +134,6 @@ async function buildWindows(payments, revenueConfig) {
     return { windows, excludedFree };
 }
 
-// SOLO TESTING (TEST_COUNT_CLAIM_PLANS): ventanas de plan sacadas de las claims
-// de Firebase para alumnos con actividad en el período y sin ningún pago que
-// les haya armado una ventana. Solo lee Firebase, no escribe nada.
-async function buildClaimWindows({ from, to, eligiblePlans, excludeUserIds }) {
-    const userIds = (
-        await CourseProgressEvent.distinct("userId", {
-            partnerId: { $ne: null },
-            occurredAt: { $gte: from, $lt: to },
-        })
-    )
-        .map(String)
-        .filter((uid) => uid && !excludeUserIds.has(uid));
-
-    const windows = [];
-    for (let i = 0; i < userIds.length; i += 100) {
-        const chunk = userIds.slice(i, i + 100).map((uid) => ({ uid }));
-        const result = await auth.getUsers(chunk);
-        for (const u of result.users) {
-            const c = u.customClaims || {};
-            const purchases = Array.isArray(c.purchases) ? c.purchases.map((p) => String(p).toLowerCase()) : [];
-            const expiry = c.purchaseExpiry && typeof c.purchaseExpiry === "object" ? c.purchaseExpiry : {};
-            for (const plan of purchases.filter((p) => eligiblePlans.includes(p))) {
-                const end = new Date(expiry[plan]);
-                if (Number.isNaN(end.getTime())) continue;
-                // La claim no guarda cuándo empezó: se toma vencimiento − duración del plan
-                const months = PLAN_DURATIONS[plan] || 0;
-                const start = months ? addMonths(end, -months) : new Date(from);
-                if (!(end > start)) continue;
-                windows.push({ userId: u.uid, plan, start, end, value: 0, discountRate: 0, paymentId: null });
-            }
-        }
-    }
-    return windows;
-}
-
 /**
  * Calcula ingresos y suscripciones elegibles del período [from, to)
  * y las ventanas de plan elegible de los alumnos (para validar los puntos).
@@ -198,7 +148,7 @@ async function computeRevenue({ from, to, revenueConfig = {} }) {
     const payments = await PaymentsMongo.find({
         status: "approved",
         isTest: { $ne: true },
-        amount: TEST_COUNT_FREE_PAYMENTS ? { $gte: 0 } : { $gt: 0 },
+        amount: { $gt: 0 },
         date: { $lt: to },
         $and: [
             { $or: [{ items: { $in: eligiblePlans } }, { plan: { $in: planRegex } }] },
@@ -208,17 +158,7 @@ async function computeRevenue({ from, to, revenueConfig = {} }) {
         .select("client_id items plan amount couponUsed discount date fulfilledAt expiresAt")
         .lean();
 
-    const { windows: paymentWindows, excludedFree } = await buildWindows(payments, revenueConfig);
-
-    const claimWindows = TEST_COUNT_CLAIM_PLANS
-        ? await buildClaimWindows({
-              from,
-              to,
-              eligiblePlans,
-              excludeUserIds: new Set(paymentWindows.map((w) => w.userId)),
-          })
-        : [];
-    const allWindows = [...paymentWindows, ...claimWindows];
+    const { windows: allWindows, excludedFree } = await buildWindows(payments, revenueConfig);
 
     const staff = await fetchStaffUids(allWindows.map((w) => w.userId));
     const windows = allWindows.filter((w) => !staff.has(w.userId));
