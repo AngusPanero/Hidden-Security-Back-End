@@ -58,3 +58,7 @@ setPlanExpiry.js
 listClaims.js
 createTestCertificate.js
 addCompletedCourse.js
+
+# Pool
+/scripts/simularPool.js
+/scripts/generateSignPinHash.js
