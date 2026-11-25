@@ -106,6 +106,19 @@ const PartnerPoolPeriodSchema = new mongoose.Schema(
         approvedBy: { type: String, default: null },
         closedAt: { type: Date, default: null },
         closedBy: { type: String, default: null },
+
+        // Se recalculó un mes anterior después de calcular este: hay que
+        // recalcularlo antes de aprobarlo (el tope usa lo pagado en los anteriores)
+        needsRecalculation: {
+            type: new mongoose.Schema(
+                {
+                    since: { type: Date, required: true },
+                    causedBy: { type: String, required: true }, // "2026-09"
+                },
+                { _id: false }
+            ),
+            default: null,
+        },
     },
     { timestamps: true, collection: "partnerPoolPeriods" }
 );

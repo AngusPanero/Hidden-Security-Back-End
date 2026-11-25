@@ -25,7 +25,7 @@ const courseDurations = require("./courseDurationService");
 //  La duración nunca agranda el fondo ni genera puntos base.
 // ══════════════════════════════════════════════════════════════════════
 
-const FORMULA_VERSION = "PP_V1.2";
+const FORMULA_VERSION = "PP_V1.2.1"; // V1.2 + tope por curso, avance acumulado y orden de meses
 const Decimal128 = mongoose.Types.Decimal128;
 const EXCLUDED_ACCESS = new Set([ACCESS_TYPES.ADMIN, ACCESS_TYPES.TEST]);
 
@@ -145,29 +145,50 @@ async function audit({ action, admin, period = null, settlementId = null, partne
 //  CÁLCULO (función pura: misma entrada → mismo resultado)
 // ══════════════════════════════════════════════════════════════════════
 //
-//  progressDelta   = pasos elegibles nuevos del período / totalEligibleSteps de la versión
-//  progressScore   = progressDelta × progressWeight (0,70)
-//  completionScore = completionWeight (0,30) si COURSE_COMPLETED ocurrió en el período
-//  totalScore      = progressScore + completionScore, con tope acumulado de 1 por
-//                    usuario + curso + versión (sumando períodos anteriores)
-//                    = PUNTOS BASE. Acá no se pondera nada: la ponderación por
-//                    duración se aplica después, una sola vez por curso
-//                    (computeDurationWeighting).
+//  Reglas de puntos (V1.2 + criterios confirmados por Hidden, nov 2026):
 //
-//  Un avance suma solo si, en el momento en que ocurrió:
-//   - lo hizo un alumno (admin, partner y enterprise nunca suman; ADMIN/TEST tampoco)
-//   - el alumno tenía un plan elegible pago y vigente (starter, pro o elite,
-//     con monto > $0), verificado contra los pagos guardados
-//   - la empresa dueña del curso no estaba baneada
-//  La inactividad nunca corta la comisión: solo se excluyen los cursos o
-//  empresas con partnerPool.enabled = false.
+//  - Tope: cada alumno suma como máximo 1 punto por CURSO, para siempre,
+//    sin importar la versión. Si ya llegó a 1 en un curso, nunca más suma en
+//    ese curso. Cursos distintos suman por separado (hasta 1 cada uno).
+//
+//  - Avance acumulado: el avance de un curso se mide sobre TODO lo que el
+//    alumno hizo hasta ese momento (este mes y los anteriores):
+//        avance   = pasos elegibles hechos / pasos elegibles de la versión
+//                   (si cursó varias versiones, se toma la de mayor avance)
+//        ganado   = avance × progressWeight (0,70) + completionWeight (0,30)
+//                   si ya terminó el curso; con tope de 1
+//    En cada mes se paga:  ganado − lo ya pagado en meses anteriores.
+//
+//  - "Ganado" se mide en el ÚLTIMO momento del mes en que el avance podía
+//    sumar (alumno con plan pago vigente y empresa activa). Lo que hizo sin
+//    plan o con la empresa suspendida no se pierde: se paga cuando vuelve a
+//    avanzar con plan vigente, en ese mismo mes o en otro.
+//
+//  - Nunca suman: admin, partner, enterprise, accesos ADMIN/TEST. Tampoco los
+//    cursos o empresas con partnerPool.enabled = false.
+//
+//  - Todo es PUNTO BASE: la ponderación por duración se aplica después, una
+//    sola vez por curso (computeDurationWeighting).
+//
+//  Para respetar el tope, lo "ya pagado" sale de los meses anteriores
+//  calculados: por eso un mes solo se calcula con todos los anteriores al día
+//  (assertPreviousPeriods en calculatePeriod).
 
-const keyOf = (userId, courseId, version) => `${userId}|${courseId}|${version}`;
+const keyOf = (userId, courseId) => `${userId}|${courseId}`;
 const courseKeyOf = (courseId, version) => `${courseId}|${version}`;
+const POOL_EVENT_TYPES = [EVENT_TYPES.STEP_COMPLETED, EVENT_TYPES.COURSE_COMPLETED, EVENT_TYPES.COURSE_STARTED];
+const EPS = 1e-12;
 
-function computeConsumption({ events, versions, partners, previousScores, config, eligibility = null }) {
+/**
+ * @param events          eventos del mes y, para el avance acumulado, los
+ *                        anteriores de esos alumnos y cursos (occurredAt < from)
+ * @param previousScores  Map "userId|courseId" → puntos ya pagados en meses anteriores
+ * @param from            inicio del mes (sin él, todos los eventos son del mes)
+ */
+function computeConsumption({ events, versions, partners, previousScores, config, eligibility = null, from = null }) {
     const progressWeight = Number(config.progressWeight);
     const completionWeight = Number(config.completionWeight);
+    const fromTime = from ? new Date(from).getTime() : -Infinity;
 
     const versionMap = new Map(versions.map((v) => [courseKeyOf(v.courseId, v.version), v]));
     const eligibleSteps = new Map(
@@ -192,117 +213,148 @@ function computeConsumption({ events, versions, partners, previousScores, config
         noPaidPlanEvents: 0,
     };
 
-    // ¿El evento cuenta para el pool? (ver reglas arriba)
-    const eventCounts = (e) => {
+    const isStaff = (e) => {
         const role = e.metadata?.role ?? null;
-        const isStaff = role ? role !== "student" : !!eligibility?.staffUserIds?.has(String(e.userId));
-        if (isStaff) {
-            warnings.excludedRoleEvents++;
-            return false;
-        }
+        return role ? role !== "student" : !!eligibility?.staffUserIds?.has(String(e.userId));
+    };
+
+    // ¿En este momento el avance podía sumar? (plan vigente y empresa activa)
+    // Solo se cuentan avisos de los eventos del mes.
+    const canEarnAt = (e, inPeriod) => {
         if (e.metadata?.partnerBanned === true) {
-            warnings.bannedPartnerEvents++;
+            if (inPeriod) warnings.bannedPartnerEvents++;
             return false;
         }
         if (eligibility) {
             if (!hadEligiblePlan(eligibility.windowsByUser, e.userId, e.occurredAt)) {
-                warnings.noPaidPlanEvents++;
+                if (inPeriod) warnings.noPaidPlanEvents++;
                 return false;
             }
             return true;
         }
         // Sin datos de pagos (solo tests): se usa la marca guardada en el evento
         if (e.metadata?.partnerPoolEligible !== true) {
-            warnings.nonEligibleEvents++;
+            if (inPeriod) warnings.nonEligibleEvents++;
             return false;
         }
         return true;
     };
-    const enrollments = new Map(); // courseKey → count
-    const perUser = new Map();     // userKey → { userId, courseId, version, steps:Set, completed, accessType }
 
-    for (const e of events) {
+    const sorted = [...events].sort((a, b) => new Date(a.occurredAt) - new Date(b.occurredAt));
+    const enrollments = new Map(); // courseKey → inscripciones del mes
+    const perCourse = new Map();   // "userId|courseId" → estado acumulado
+
+    for (const e of sorted) {
+        const at = new Date(e.occurredAt).getTime();
+        const inPeriod = at >= fromTime;
+
         const accessType = e.metadata?.accessType ?? null;
         if (accessType && EXCLUDED_ACCESS.has(accessType)) {
-            warnings.excludedAccessEvents++;
+            if (inPeriod) warnings.excludedAccessEvents++;
             continue;
         }
-
         const cKey = courseKeyOf(e.courseId, e.courseVersion);
         const v = versionMap.get(cKey);
         if (!v) {
-            warnings.unknownVersions.add(cKey);
+            if (inPeriod) warnings.unknownVersions.add(cKey);
             continue;
         }
-
-        if (!eventCounts(e)) continue;
+        if (isStaff(e)) {
+            if (inPeriod) warnings.excludedRoleEvents++;
+            continue;
+        }
 
         if (e.eventType === EVENT_TYPES.COURSE_STARTED) {
-            enrollments.set(cKey, (enrollments.get(cKey) || 0) + 1);
+            if (inPeriod && canEarnAt(e, true)) enrollments.set(cKey, (enrollments.get(cKey) || 0) + 1);
             continue;
         }
 
-        const uKey = keyOf(e.userId, e.courseId, e.courseVersion);
-        if (!perUser.has(uKey)) {
-            perUser.set(uKey, {
+        const key = keyOf(e.userId, e.courseId);
+        if (!perCourse.has(key)) {
+            perCourse.set(key, {
                 userId: e.userId,
                 courseId: e.courseId,
-                version: e.courseVersion,
-                steps: new Set(),
-                completed: false,
+                stepsByVersion: new Map(),
+                completedAt: null,
+                periodNewSteps: 0,
                 accessType,
+                pay: null, // foto del avance en el último momento del mes en que podía sumar
             });
         }
-        const u = perUser.get(uKey);
-        u.accessType = accessType || u.accessType;
+        const s = perCourse.get(key);
+        s.accessType = accessType || s.accessType;
 
+        // El avance se acumula siempre (con o sin plan): lo hecho sin plan se paga después
         if (e.eventType === EVENT_TYPES.STEP_COMPLETED) {
-            if (e.stepId && eligibleSteps.get(cKey).has(e.stepId)) u.steps.add(e.stepId);
+            if (e.stepId && eligibleSteps.get(cKey).has(e.stepId)) {
+                if (!s.stepsByVersion.has(cKey)) s.stepsByVersion.set(cKey, new Set());
+                const set = s.stepsByVersion.get(cKey);
+                if (!set.has(e.stepId)) {
+                    set.add(e.stepId);
+                    if (inPeriod) s.periodNewSteps++;
+                }
+            }
         } else if (e.eventType === EVENT_TYPES.COURSE_COMPLETED) {
-            u.completed = true;
+            if (s.completedAt == null) s.completedAt = at;
+        }
+
+        if (inPeriod && canEarnAt(e, true)) {
+            let progress = 0;
+            for (const [vk, set] of s.stepsByVersion) {
+                const total = versionMap.get(vk).totalEligibleSteps || 0;
+                if (total) progress = Math.max(progress, Math.min(1, set.size / total));
+            }
+            s.pay = {
+                version: e.courseVersion,
+                progress,
+                completed: s.completedAt != null,
+                completedInPeriod: s.completedAt != null && s.completedAt >= fromTime,
+                periodNewSteps: s.periodNewSteps,
+            };
         }
     }
 
     const snapshots = [];
-    for (const [uKey, u] of perUser) {
-        const v = versionMap.get(courseKeyOf(u.courseId, u.version));
+    for (const [key, s] of perCourse) {
+        if (!s.pay) continue; // en el mes no hubo ningún momento en que pudiera sumar
+        const v = versionMap.get(courseKeyOf(s.courseId, s.pay.version));
         if (!participates(v)) continue;
+        const earnedProgress = s.pay.progress * progressWeight;
+        const earnedCompletion = s.pay.completed ? completionWeight : 0;
+        const rawEarned = earnedProgress + earnedCompletion;
+        const earned = Math.min(1, rawEarned);
 
-        const totalEligible = v.totalEligibleSteps || 0;
-        const newSteps = u.steps.size;
-        if (!newSteps && !u.completed) continue;
+        const previous = previousScores.get(key) || 0;
+        const totalScore = Math.max(0, earned - previous);
+        // Sin nada para pagar y sin avance nuevo en el mes: no hay registro
+        if (totalScore <= EPS && !s.pay.periodNewSteps && !s.pay.completedInPeriod) continue;
 
-        const progressDelta = totalEligible ? newSteps / totalEligible : 0;
-        const progressScore = progressDelta * progressWeight;
-        const completionScore = u.completed ? completionWeight : 0;
-        const rawScore = progressScore + completionScore;
-
-        const previous = previousScores.get(uKey) || 0;
-        const allowed = Math.max(0, 1 - previous);
-        const totalScore = Math.min(rawScore, allowed);
-        const cappedBy = rawScore - totalScore;
+        // Desglose: lo pagado antes cubre primero el avance
+        const progressScore = Math.min(totalScore, Math.max(0, earnedProgress - previous));
+        const completionScore = Math.max(0, totalScore - progressScore);
 
         snapshots.push({
-            userId: u.userId,
-            courseId: u.courseId,
-            courseVersion: u.version,
+            userId: s.userId,
+            courseId: s.courseId,
+            courseVersion: s.pay.version,
             partnerId: String(v.partnerId),
-            accessType: u.accessType,
+            accessType: s.accessType,
             courseSnapshot: {
                 title: v.title,
-                totalEligibleSteps: totalEligible,
+                totalEligibleSteps: v.totalEligibleSteps || 0,
                 estimatedDurationMinutes: v.estimatedDurationMinutes ?? null,
                 moduleCount: v.moduleCount ?? 0,
                 courseWeight: 1, // V1.2: sin peso fijo por curso (campo histórico)
             },
             consumption: {
-                newCompletedSteps: newSteps,
-                progressDelta,
-                completedDuringPeriod: u.completed,
+                newCompletedSteps: s.pay.periodNewSteps,
+                progressDelta: progressWeight ? progressScore / progressWeight : 0,
+                completedDuringPeriod: s.pay.completedInPeriod,
                 progressScore,
                 completionScore,
                 totalScore,
-                cappedBy: cappedBy > 1e-12 ? cappedBy : null,
+                // lo que pasó del tope de 1 punto en el curso
+                cappedBy: rawEarned - 1 > EPS ? rawEarned - 1 : null,
                 weightedScore: totalScore, // campo histórico: = puntos base
             },
         });
@@ -503,6 +555,98 @@ const finalAmountOf = (settlementAmount, adjustments) =>
     );
 
 // ══════════════════════════════════════════════════════════════════════
+//  ORDEN DE LOS MESES
+//  El tope de 1 punto por curso descuenta lo pagado en meses anteriores, así
+//  que un mes solo se calcula, aprueba o cierra con los anteriores al día.
+//  Solo cuentan los meses que tuvieron avances de cursos de partners.
+// ══════════════════════════════════════════════════════════════════════
+const MONTHS_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
+const periodLabel = (period) => {
+    const [y, m] = period.split("-").map(Number);
+    return `${MONTHS_ES[m - 1]} ${y}`;
+};
+const shiftPeriod = (period, delta) => {
+    const [y, m] = period.split("-").map(Number);
+    const d = new Date(Date.UTC(y, m - 1 + delta, 1));
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+};
+// Mes argentino de una fecha
+const periodOfDate = (date) => {
+    const d = new Date(new Date(date).getTime() - AR_OFFSET_HOURS * 3600 * 1000);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+};
+
+const READY_FOR = {
+    calculate: { statuses: ["CALCULATED", "APPROVED", "CLOSED"], verb: "calculá" },
+    approve: { statuses: ["APPROVED", "CLOSED"], verb: "aprobá" },
+    close: { statuses: ["CLOSED"], verb: "cerrá" },
+};
+
+/**
+ * Primer mes anterior a `period` que tuvo avances y no está listo para `action`.
+ * Devuelve el motivo (texto para el panel) o null si está todo al día.
+ */
+async function previousPeriodBlocker(period, from, action) {
+    const rule = READY_FOR[action];
+    const first = await CourseProgressEvent.findOne({
+        partnerId: { $ne: null },
+        occurredAt: { $lt: from },
+        eventType: { $in: POOL_EVENT_TYPES },
+    })
+        .sort({ occurredAt: 1 })
+        .select("occurredAt")
+        .lean();
+    if (!first) return null;
+
+    const months = [];
+    for (let p = periodOfDate(first.occurredAt); p < period && months.length < 240; p = shiftPeriod(p, 1)) months.push(p);
+    if (!months.length) return null;
+
+    const docs = await PartnerPoolPeriod.find({ period: { $in: months } })
+        .select("period status needsRecalculation")
+        .lean();
+    const byPeriod = new Map(docs.map((d) => [d.period, d]));
+
+    for (const m of months) {
+        const doc = byPeriod.get(m);
+        if (doc && rule.statuses.includes(doc.status) && !doc.needsRecalculation) continue;
+
+        const range = parsePeriod(m);
+        const hadEvents = await CourseProgressEvent.findOne({
+            partnerId: { $ne: null },
+            occurredAt: { $gte: range.from, $lt: range.to },
+            eventType: { $in: POOL_EVENT_TYPES },
+        })
+            .select("_id")
+            .lean();
+        if (!hadEvents) continue;
+
+        if (doc?.needsRecalculation) {
+            return `Primero recalculá ${periodLabel(m)}: quedó desactualizado.`;
+        }
+        return `Primero ${rule.verb} ${periodLabel(m)}: tiene avances de alumnos y todavía no está ${
+            action === "calculate" ? "calculado" : action === "approve" ? "aprobado" : "cerrado"
+        }.`;
+    }
+    return null;
+}
+
+// Mes posterior que impide recalcular `period` (se está calculando, o ya está aprobado/cerrado)
+async function laterPeriodBlocker(period) {
+    const later = await PartnerPoolPeriod.findOne({
+        period: { $gt: period },
+        status: { $in: ["CALCULATING", "APPROVED", "CLOSED"] },
+    })
+        .sort({ period: 1 })
+        .select("period status")
+        .lean();
+    if (!later) return null;
+    return later.status === "CALCULATING"
+        ? `Se está calculando ${periodLabel(later.period)}: esperá a que termine.`
+        : `${periodLabel(later.period)} ya está ${later.status === "APPROVED" ? "aprobado" : "cerrado"}: reabrilo antes de recalcular este mes.`;
+}
+
+// ══════════════════════════════════════════════════════════════════════
 //  FLUJO
 // ══════════════════════════════════════════════════════════════════════
 
@@ -510,8 +654,15 @@ async function calculatePeriod(periodInput, admin) {
     const { period, from, to } = parsePeriod(periodInput);
     if (to > new Date()) throw httpError(409, "El período todavía no terminó: se calcula cuando cierra el mes");
 
+    // Orden de los meses: los anteriores calculados y ninguno posterior aprobado
+    const blockedBefore = await previousPeriodBlocker(period, from, "calculate");
+    if (blockedBefore) throw httpError(409, blockedBefore);
+    const blockedAfter = await laterPeriodBlocker(period);
+    if (blockedAfter) throw httpError(409, blockedAfter);
+
     // Bloqueo: solo un cálculo a la vez y nunca sobre períodos aprobados o cerrados
     let previousStatus = "OPEN";
+    let createdNow = false;
     let locked = await PartnerPoolPeriod.findOneAndUpdate(
         { period, status: { $in: ["OPEN", "CALCULATED"] } },
         { $set: { status: "CALCULATING" } },
@@ -532,9 +683,21 @@ async function calculatePeriod(periodInput, admin) {
         }
         try {
             await PartnerPoolPeriod.create({ period, status: "CALCULATING", range: { from, to } });
+            createdNow = true;
         } catch {
             throw httpError(409, "El período ya se está calculando");
         }
+    }
+
+    // Un solo cálculo a la vez en todo el pool: un mes usa lo pagado en los
+    // anteriores, así que dos meses calculándose juntos podrían pisarse
+    const other = await PartnerPoolPeriod.findOne({ period: { $ne: period }, status: "CALCULATING" })
+        .select("period")
+        .lean();
+    if (other) {
+        if (createdNow) await PartnerPoolPeriod.deleteOne({ period, status: "CALCULATING" });
+        else await PartnerPoolPeriod.updateOne({ period, status: "CALCULATING" }, { $set: { status: previousStatus } });
+        throw httpError(409, `Se está calculando ${periodLabel(other.period)}: esperá a que termine y volvé a intentar.`);
     }
 
     try {
@@ -551,32 +714,43 @@ async function calculatePeriod(periodInput, admin) {
                 .lean(),
         ]);
 
-        const pairs = [...new Set(events.map((e) => courseKeyOf(e.courseId, e.courseVersion)))].map((k) => {
+        // Avance acumulado: lo que esos alumnos hicieron antes en esos cursos
+        const userIds = [...new Set(events.map((e) => e.userId))];
+        const courseIds = [...new Set(events.map((e) => e.courseId))];
+        const history = userIds.length
+            ? await CourseProgressEvent.find({
+                  partnerId: { $ne: null },
+                  userId: { $in: userIds },
+                  courseId: { $in: courseIds },
+                  occurredAt: { $lt: from },
+                  eventType: { $in: [EVENT_TYPES.STEP_COMPLETED, EVENT_TYPES.COURSE_COMPLETED] },
+              })
+                  .select("userId courseId courseVersion partnerId eventType stepId metadata occurredAt")
+                  .lean()
+            : [];
+        const allEvents = [...history, ...events];
+
+        const pairs = [...new Set(allEvents.map((e) => courseKeyOf(e.courseId, e.courseVersion)))].map((k) => {
             const [courseId, version] = k.split("|");
             return { courseId, version: Number(version) };
         });
         const versions = pairs.length ? await CourseVersion.find({ $or: pairs }).lean() : [];
 
-        // Puntos ya liquidados en períodos anteriores (para el tope de 1 por recorrido)
-        const userIds = [...new Set(events.map((e) => e.userId))];
+        // Puntos ya pagados en meses anteriores, por alumno y CURSO (todas las versiones)
         const previousRows = userIds.length
             ? await PartnerPoolConsumption.aggregate([
-                  { $match: { period: { $lt: period }, userId: { $in: userIds } } },
-                  {
-                      $group: {
-                          _id: { u: "$userId", c: "$courseId", v: "$courseVersion" },
-                          total: { $sum: "$consumption.totalScore" },
-                      },
-                  },
+                  { $match: { period: { $lt: period }, userId: { $in: userIds }, courseId: { $in: courseIds } } },
+                  { $group: { _id: { u: "$userId", c: "$courseId" }, total: { $sum: "$consumption.totalScore" } } },
               ])
             : [];
-        const previousScores = new Map(previousRows.map((r) => [keyOf(r._id.u, r._id.c, r._id.v), num(r.total)]));
+        const previousScores = new Map(previousRows.map((r) => [keyOf(r._id.u, r._id.c), num(r.total)]));
 
         // Ingresos, suscripciones y planes vigentes de cada alumno (desde los pagos)
         const revenue = await computeRevenue({ from, to, revenueConfig: config.revenue || {} });
 
         const result = computeConsumption({
-            events,
+            events: allEvents,
+            from,
             versions,
             partners,
             previousScores,
@@ -782,10 +956,25 @@ async function calculatePeriod(periodInput, admin) {
                         approvedBy: null,
                         closedAt: null,
                         closedBy: null,
+                        needsRecalculation: null, // recién calculado: queda al día
                     },
                 },
                 { session }
             );
+
+            // Los meses posteriores ya calculados usaron lo pagado en este mes:
+            // quedan marcados y no se aprueban hasta recalcularlos
+            const stale = await PartnerPoolPeriod.find({ period: { $gt: period }, status: "CALCULATED" })
+                .session(session)
+                .select("period")
+                .lean();
+            if (stale.length) {
+                await PartnerPoolPeriod.updateMany(
+                    { period: { $in: stale.map((p) => p.period) }, status: "CALCULATED" },
+                    { $set: { needsRecalculation: { since: now, causedBy: period } } },
+                    { session }
+                );
+            }
 
             await audit({
                 action: "CALCULATED",
@@ -802,6 +991,8 @@ async function calculatePeriod(periodInput, admin) {
                     requiresReview: weighting.requiresReview,
                     enabledPoolAmount: fin.enabledPoolAmount,
                     warnings: result.warnings,
+                    historyEvents: history.length,
+                    markedForRecalculation: stale.map((p) => p.period),
                 },
             });
         });
@@ -815,17 +1006,33 @@ async function calculatePeriod(periodInput, admin) {
 }
 
 async function approvePeriod(periodInput, admin) {
-    const { period } = parsePeriod(periodInput);
+    const { period, from } = parsePeriod(periodInput);
+    // Orden de los meses: no se aprueba con un mes anterior sin aprobar
+    const blockedBefore = await previousPeriodBlocker(period, from, "approve");
+    if (blockedBefore) throw httpError(409, blockedBefore);
+
     await runInTransaction(async (session) => {
         const now = new Date();
-        // V1.2: no se aprueba si hay cursos con puntos y sin duración aprobada
+        // V1.2: no se aprueba si hay cursos con puntos y sin duración aprobada,
+        // ni si quedó desactualizado por el recálculo de un mes anterior
         const updated = await PartnerPoolPeriod.findOneAndUpdate(
-            { period, status: "CALCULATED", "durationWeighting.requiresReview": { $ne: true } },
+            {
+                period,
+                status: "CALCULATED",
+                "durationWeighting.requiresReview": { $ne: true },
+                needsRecalculation: null,
+            },
             { $set: { status: "APPROVED", approvedAt: now, approvedBy: admin.uid } },
             { session, returnDocument: "after" }
         ).lean();
         if (!updated) {
             const current = await PartnerPoolPeriod.findOne({ period }).session(session).lean();
+            if (current?.status === "CALCULATED" && current?.needsRecalculation) {
+                throw httpError(
+                    409,
+                    `Este mes quedó desactualizado porque se recalculó ${periodLabel(current.needsRecalculation.causedBy)}. Recalculalo antes de aprobar.`
+                );
+            }
             if (current?.status === "CALCULATED" && current?.durationWeighting?.requiresReview) {
                 throw httpError(
                     409,
@@ -851,7 +1058,9 @@ async function approvePeriod(periodInput, admin) {
 }
 
 async function closePeriod(periodInput, admin) {
-    const { period } = parsePeriod(periodInput);
+    const { period, from } = parsePeriod(periodInput);
+    const blockedBefore = await previousPeriodBlocker(period, from, "close");
+    if (blockedBefore) throw httpError(409, blockedBefore);
     await runInTransaction(async (session) => {
         const updated = await PartnerPoolPeriod.findOneAndUpdate(
             { period, status: "APPROVED" },
@@ -1098,6 +1307,7 @@ async function listPeriods() {
             paid: t?.paid ?? 0,
             totalFinal: t?.totalFinal ?? null,
             calculatedAt: p.calculatedAt,
+            needsRecalculation: p.needsRecalculation || null,
         });
     });
 }
@@ -1109,9 +1319,23 @@ async function getPeriodDetail(periodInput) {
         PartnerPoolSettlement.find({ period }).sort({ finalAmount: -1 }).lean(),
         PartnerPoolAuditLog.find({ period }).sort({ occurredAt: -1 }).limit(100).lean(),
     ]);
+    // Motivos por los que el panel no deja calcular / aprobar / cerrar (orden de meses)
+    const status = doc?.status || "OPEN";
+    const [calculateBlocked, approveBlocked, closeBlocked] = await Promise.all([
+        ["OPEN", "CALCULATED"].includes(status) && to <= new Date()
+            ? previousPeriodBlocker(period, from, "calculate").then((r) => r || laterPeriodBlocker(period))
+            : null,
+        status === "CALCULATED" ? previousPeriodBlocker(period, from, "approve") : null,
+        status === "APPROVED" ? previousPeriodBlocker(period, from, "close") : null,
+    ]);
     return plain({
         period: doc || { period, status: "OPEN", range: { from, to } },
         canCalculate: to <= new Date(),
+        blockedReasons: {
+            calculate: calculateBlocked || null,
+            approve: approveBlocked || null,
+            close: closeBlocked || null,
+        },
         settlements,
         auditLogs,
     });

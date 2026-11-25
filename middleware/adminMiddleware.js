@@ -1,4 +1,5 @@
 const auth = require("../config/firebase");
+const Audit = require("../models/AuditSchema");
 const esProduccion = (process.env.NODE_ENV === 'production');
 
 const adminMiddleware = async (req, res, next) => {
@@ -10,7 +11,7 @@ const adminMiddleware = async (req, res, next) => {
     }
     try {
         // checkRevoked = true → si se revocaron los refresh tokens (ban, cambio
-        // de rol), el token viejo deja de servir al instante
+        // de rol, bloqueo por PIN), el token viejo deja de servir al instante
         const decodedClaims = await auth.verifyIdToken(token, true);
 
         if (decodedClaims.banned === true) {
@@ -20,6 +21,23 @@ const adminMiddleware = async (req, res, next) => {
         if (decodedClaims.admin !== true) {
             console.warn(`ADMIN_ACCESS_DENIED 🔴 uid=${decodedClaims.uid} ${req.method} ${req.originalUrl}`);
             return res.status(403).json({ message: "ACCESS_DENIED: ADMIN_ONLY_ZONE 🔴" });
+        }
+
+        // El token tiene que venir de un login que pasó la clave de firma.
+        // /login guarda el auth_time de ese inicio de sesión; un idToken
+        // conseguido por fuera (solo con la contraseña) tiene otro auth_time.
+        const pinSession = await Audit.exists({
+            uid:               decodedClaims.uid,
+            event:             "admin-pin-session",
+            "metadata.authTime": decodedClaims.auth_time,
+        });
+
+        if (!pinSession) {
+            console.warn(`ADMIN_PIN_SESSION_MISSING 🔴 uid=${decodedClaims.uid} ${req.method} ${req.originalUrl}`);
+            return res.status(403).json({
+                code:    "ADMIN_PIN_SESSION_REQUIRED",
+                message: "Volvé a iniciar sesión con tu clave de firma.",
+            });
         }
 
         req.user = decodedClaims;

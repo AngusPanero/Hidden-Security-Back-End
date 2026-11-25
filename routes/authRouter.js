@@ -12,6 +12,8 @@ const loginLimiter = require("../middleware/rateLimitMiddleware")
 const checkBanned = require("../middleware/checkBanned")
 const verifyToken = require("../middleware/authMiddleware")
 const adminMiddleware = require("../middleware/adminMiddleware")
+// Clave de firma del admin (mismo util que usa el script de generación del hash)
+const { verifyPin } = require("../utils/signPin")
 // Axios
 const axios = require("axios")
 // BREVO
@@ -245,6 +247,97 @@ const getClientIp = (req) => {
     return req.ip || null;
 };
 
+// ─── Helper: PIN de firma del admin en el login ───────────────────────────────
+// 4 dígitos = 10.000 combinaciones: sin límite de intentos se adivina en minutos.
+// Por eso: 5 intentos y bloqueo temporal de 15 min (nunca ban: no te podés
+// dejar afuera vos mismo). Llegar al límite significa que la contraseña del
+// admin está filtrada → se revocan sus sesiones y queda un security-threat.
+const ADMIN_PIN_MAX_ATTEMPTS = 5;
+const ADMIN_PIN_LOCK_MS      = 15 * 60 * 1000;
+
+async function checkAdminPin({ uid, email, adminPin, req }) {
+    // Sin PIN: se le pide al front que lo muestre. No cuenta como intento.
+    if (adminPin === undefined || adminPin === null || adminPin === "") {
+        return { ok: false, status: 403, body: {
+            code: "auth/admin-pin-required",
+            message: "Ingresá tu clave de firma.",
+        }};
+    }
+
+    // Solo un string de 4 dígitos (frena objetos tipo {"$ne": null} y basura)
+    if (typeof adminPin !== "string" || !/^\d{4}$/.test(adminPin)) {
+        return { ok: false, status: 400, body: {
+            code: "auth/admin-pin-format",
+            message: "La clave de firma son 4 dígitos.",
+        }};
+    }
+
+    const now    = new Date();
+    const filter = { uid, event: "admin-pin-failed" };
+
+    // Si el último intento fue hace más de 15 min, el contador vuelve a cero
+    await Audit.updateOne(
+        { ...filter, lastAttemptAt: { $lt: new Date(now.getTime() - ADMIN_PIN_LOCK_MS) } },
+        { $set: { attempts: 0 } }
+    );
+
+    // El intento se reserva ANTES de verificar y de forma atómica: así 100
+    // pedidos en paralelo no consiguen 100 intentos (leer-chequear-guardar no sirve)
+    const attempt = await Audit.findOneAndUpdate(
+        filter,
+        { $inc: { attempts: 1 }, $set: { lastAttemptAt: now, email } },
+        { upsert: true, returnDocument: "after" }
+    );
+
+    if (attempt.attempts > ADMIN_PIN_MAX_ATTEMPTS) {
+        return { ok: false, status: 429, body: {
+            code: "auth/admin-pin-locked",
+            message: "Clave de firma bloqueada. Probá de nuevo en 15 minutos.",
+        }};
+    }
+
+    const valid = await verifyPin(adminPin);
+
+    if (valid) {
+        await Audit.updateOne(filter, { $set: { attempts: 0, lastAttemptAt: null } });
+        return { ok: true };
+    }
+
+    const remaining = ADMIN_PIN_MAX_ATTEMPTS - attempt.attempts;
+
+    if (remaining <= 0) {
+        // Alguien tiene la contraseña del admin y está probando PINs
+        try {
+            await auth.revokeRefreshTokens(uid);
+        } catch (err) {
+            console.error(esProduccion ? "Admin PIN lock revoke failed 🔴" : `Admin PIN lock revoke failed 🔴 ${err}`);
+        }
+        try {
+            await Audit.create({
+                uid,
+                email,
+                event:     "security-threat",
+                ip:        getClientIp(req),
+                userAgent: req.headers["user-agent"],
+                metadata:  { reason: "admin-pin-bruteforce", actionTaken: "locked-15m" },
+            });
+        } catch (err) {
+            console.error(esProduccion ? "Audit admin-pin-bruteforce failed 🔴" : `Audit admin-pin-bruteforce failed 🔴 ${err}`);
+        }
+        console.warn(`🚨 SECURITY_THREAT // admin-pin-bruteforce uid=${uid} ip=${getClientIp(req)}`);
+
+        return { ok: false, status: 429, body: {
+            code: "auth/admin-pin-locked",
+            message: "Clave de firma bloqueada. Probá de nuevo en 15 minutos.",
+        }};
+    }
+
+    return { ok: false, status: 401, body: {
+        code: "auth/admin-pin-invalid",
+        remaining,
+    }};
+}
+
 authRouter.post("/register", async (req, res) => {
     const { email, password, acceptedLegal } = req.body
     const regex = /^(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+=[\]{};':"\\|,.<>/?`~-]).{10,}$/;
@@ -315,7 +408,13 @@ authRouter.post("/register", async (req, res) => {
 
 // ─── POST /login ──────────────────────────────────────────────────────────────
 authRouter.post("/login", loginLimiter, async (req, res) => {
-    const { email, password, acceptedLegal } = req.body;
+    const { email, password, acceptedLegal, adminPin } = req.body || {};
+
+    // Tipos estrictos: un objeto en email terminaría como filtro de Mongo en la auditoría
+    if (typeof email !== "string" || typeof password !== "string" || !email || !password
+        || email.length > 254 || password.length > 128) {
+        return res.status(400).json({ code: "auth/invalid-input", message: "Email y contraseña son requeridos." });
+    }
 
     try {
         // 0. Verificar que el email existe antes de intentar autenticar
@@ -331,7 +430,8 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
         // 1. Validar credenciales contra la API de Firebase Auth
         const firebaseResponse = await axios.post(
             `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${process.env.FIREBASE_API_KEY}`,
-            { email, password, returnSecureToken: true }
+            { email, password, returnSecureToken: true },
+            { timeout: 8000 } // si Google tarda, no se cuelga el worker
         );
 
         const { idToken, localId: uid } = firebaseResponse.data;
@@ -357,6 +457,15 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
                     code:    "auth/email-not-verified",
                     message: "Debés verificar tu email antes de ingresar.",
                 });
+            }
+        }
+
+        // 4.2 Segundo factor del admin: clave de firma. Va ANTES de emitir la
+        // cookie: con la contraseña sola no se obtiene sesión de admin.
+        if (isAdmin) {
+            const pinCheck = await checkAdminPin({ uid, email: decoded.email, adminPin, req });
+            if (!pinCheck.ok) {
+                return res.status(pinCheck.status).json(pinCheck.body);
             }
         }
 
@@ -404,6 +513,25 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
             ip: getClientIp(req), // IP real detrás de Cloudflare + Render
             userAgent: req.headers["user-agent"]
         });
+
+        // 5.5 Atar la sesión de admin a ESTE login con PIN.
+        // auth_time es el momento del inicio de sesión en Firebase y se mantiene
+        // en los refrescos del token. Si alguien consigue un idToken del admin
+        // por otro lado (signInWithPassword directo), tiene otro auth_time y
+        // adminMiddleware lo rechaza. Un login nuevo reemplaza al anterior.
+        if (isAdmin) {
+            await Audit.findOneAndUpdate(
+                { uid, event: "admin-pin-session" },
+                { $set: {
+                    email:         decoded.email,
+                    metadata:      { authTime: decoded.auth_time },
+                    ip:            getClientIp(req),
+                    userAgent:     req.headers["user-agent"]?.slice(0, 500) || null,
+                    lastAttemptAt: new Date(),
+                }},
+                { upsert: true }
+            );
+        }
 
         // 6. Configurar Cookie
         if (esProduccion) {
