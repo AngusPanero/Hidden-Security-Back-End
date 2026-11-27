@@ -226,18 +226,6 @@ async function sendPasswordResetEmailBrevo(email) {
     });
 }
 
-// ─── Helper: verificar si un email existe en Firebase ─────────────────────────
-async function emailExistsInFirebase(email) {
-    try {
-        await auth.getUserByEmail(email);
-        return true;
-    } catch (err) {
-        if (err.code === "auth/user-not-found") return false;
-        throw err;
-    }
-}
-
-// ─── POST /register ───────────────────────────────────────────────────────────
 // IP real del cliente detrás de Cloudflare + Render
 const getClientIp = (req) => {
     const cfIp = req.headers["cf-connecting-ip"];
@@ -245,6 +233,105 @@ const getClientIp = (req) => {
     const forwarded = req.headers["x-forwarded-for"];
     if (forwarded) return String(forwarded).split(",")[0].trim();
     return req.ip || null;
+};
+
+// Email normalizado: "User@X.com " y "user@x.com" son la misma cuenta en
+// Firebase, así que también tienen que compartir contador de intentos y cooldown
+const normalizeEmail = (value) => (typeof value === "string" ? value.trim().toLowerCase() : "");
+const isValidEmail   = (email) => !!email && email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+// ─── Rate limit de las rutas que crean cuentas o mandan mails (H-01) ──────────
+// Por IP real (cf-connecting-ip). ipKeyGenerator existe desde express-rate-limit
+// v8 y agrupa IPv6 por subred; en v7 se usa la IP tal cual.
+const rateLimitLib   = require("express-rate-limit");
+const rateLimit      = rateLimitLib.rateLimit || rateLimitLib;
+const ipKeyGenerator = rateLimitLib.ipKeyGenerator || ((ip) => ip);
+
+const makeLimiter = (limit, windowMs) => rateLimit({
+    windowMs,
+    limit,
+    standardHeaders: "draft-7",
+    legacyHeaders:   false,
+    keyGenerator:    (req) => ipKeyGenerator(getClientIp(req) || "unknown"),
+    handler:         (req, res) => res.status(429).json({
+        code:    "auth/too-many-requests",
+        message: "Demasiados intentos. Probá de nuevo en un rato.",
+    }),
+});
+
+// 20 altas por hora por IP: deja registrarse a un aula entera detrás de la
+// misma IP. La defensa fuerte contra bots es Turnstile, no este número.
+const registerLimiter = makeLimiter(20, 60 * 60 * 1000);
+// Reenvío de verificación y reset: 5 por hora por IP
+const emailLimiter    = makeLimiter(5,  60 * 60 * 1000);
+
+// ─── Cloudflare Turnstile (captcha) en el registro (H-01) ─────────────────────
+// En producción sin TURNSTILE_SECRET el registro se rechaza (fail closed):
+// configurá la variable en Render ANTES de deployar. En local sin clave se saltea.
+async function verifyTurnstile(token, ip) {
+    const secret = process.env.TURNSTILE_SECRET;
+    if (!secret) {
+        if (esProduccion) {
+            console.error("TURNSTILE_SECRET missing — registro bloqueado 🔴");
+            return false;
+        }
+        return true;
+    }
+    if (typeof token !== "string" || !token || token.length > 2048) return false;
+    try {
+        const params = new URLSearchParams({ secret, response: token });
+        if (ip) params.append("remoteip", ip);
+        const { data } = await axios.post(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            params.toString(),
+            { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 8000 }
+        );
+        return data?.success === true;
+    } catch (err) {
+        console.error(esProduccion ? "Turnstile verify failed 🔴" : `Turnstile verify failed 🔴 ${err}`);
+        return false;
+    }
+}
+
+// ─── Cooldown por email para los mails transaccionales (H-01) ─────────────────
+// El rate limit es por IP: con muchas IPs se podría bombardear la casilla de
+// una víctima usando Brevo. Esto limita a 1 mail de cada tipo por minuto por
+// destinatario, venga de donde venga el pedido.
+const EMAIL_COOLDOWN_MS = 60 * 1000;
+
+async function emailCooldownOk(email, kind) {
+    const now    = new Date();
+    const filter = { email, event: "email-cooldown", "metadata.kind": kind };
+    const last   = await Audit.findOne(filter).select("lastAttemptAt").lean();
+    if (last?.lastAttemptAt && now - new Date(last.lastAttemptAt) < EMAIL_COOLDOWN_MS) {
+        return false;
+    }
+    await Audit.updateOne(filter, { $set: { lastAttemptAt: now } }, { upsert: true });
+    return true;
+}
+
+// Los mails de las rutas con respuesta genérica se mandan sin await: así el
+// tiempo de respuesta no delata si la cuenta existe (oráculo por timing)
+const sendInBackground = (promise, context) => {
+    promise.catch((err) => {
+        console.error(esProduccion ? `${context} 🔴` : `${context} 🔴 ${err}`);
+    });
+};
+
+// ─── Bloqueo temporal del login (H-02) ────────────────────────────────────────
+// Antes: 5 fallos = ban permanente → cualquiera que supiera un email podía
+// banear esa cuenta. Ahora: 5 fallos = 15 min bloqueado, se desbloquea solo,
+// y la respuesta es la misma exista o no la cuenta.
+const LOGIN_MAX_ATTEMPTS = 5;
+const LOGIN_LOCK_MS      = 15 * 60 * 1000;
+
+const LOGIN_INVALID = {
+    code:    "auth/invalid-credential",
+    message: "Email o contraseña incorrectos.",
+};
+const LOGIN_LOCKED = {
+    code:    "auth/too-many-attempts",
+    message: "Demasiados intentos. Probá de nuevo en 15 minutos.",
 };
 
 // ─── Helper: PIN de firma del admin en el login ───────────────────────────────
@@ -338,11 +425,15 @@ async function checkAdminPin({ uid, email, adminPin, req }) {
     }};
 }
 
-authRouter.post("/register", async (req, res) => {
-    const { email, password, acceptedLegal } = req.body
+// ─── POST /register ───────────────────────────────────────────────────────────
+authRouter.post("/register", registerLimiter, async (req, res) => {
+    const { password, acceptedLegal, turnstileToken } = req.body || {};
+    const email = normalizeEmail(req.body?.email);
     const regex = /^(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+=[\]{};':"\\|,.<>/?`~-]).{10,}$/;
+    // Misma respuesta para cuenta nueva y para email ya registrado (H-02)
+    const genericCreated = { message: `User created successfully! 🟢` };
     try {
-        if (!email || typeof password !== "string"){
+        if (!isValidEmail(email) || typeof password !== "string" || password.length > 128){
             return res.status(400).json({ message: "All fields are required to create an user! 🔴" })
         }
 
@@ -358,7 +449,41 @@ authRouter.post("/register", async (req, res) => {
             });
         }
 
-        const userRecord = await auth.createUser({ email, password })
+        // Anti-bot: el token de Turnstile se valida contra Cloudflare (H-01)
+        const human = await verifyTurnstile(turnstileToken, getClientIp(req));
+        if (!human) {
+            return res.status(400).json({
+                code:    "auth/captcha-failed",
+                message: "No pudimos verificar que seas una persona. Probá de nuevo.",
+            });
+        }
+
+        let userRecord;
+        try {
+            userRecord = await auth.createUser({ email, password });
+        } catch (createErr) {
+            if (createErr.code !== "auth/email-already-exists") throw createErr;
+
+            // El email ya tiene cuenta: se responde igual que un alta nueva para
+            // no revelarlo, y el dueño real recibe un mail útil en su casilla:
+            // sin verificar → verificación de nuevo; verificada → link de reset.
+            try {
+                const existing = await auth.getUserByEmail(email);
+                const blocked  = existing.disabled || existing.customClaims?.banned === true;
+                if (!blocked) {
+                    const kind = existing.emailVerified ? "reset" : "verify";
+                    if (await emailCooldownOk(email, kind)) {
+                        sendInBackground(
+                            existing.emailVerified ? sendPasswordResetEmailBrevo(email) : sendVerificationEmail(email),
+                            "Register existing-account email failed"
+                        );
+                    }
+                }
+            } catch (existingErr) {
+                console.error(esProduccion ? "Register existing-account check failed 🔴" : `Register existing-account check failed 🔴 ${existingErr}`);
+            }
+            return res.status(201).send(genericCreated);
+        }
 
         // Guardar el consentimiento. Si falla, se borra el usuario:
         // no puede existir una cuenta sin constancia de aceptación.
@@ -386,21 +511,18 @@ authRouter.post("/register", async (req, res) => {
             return res.status(500).send({ message: `Error creating user! 🔴` })
         }
 
-        // Enviar email de verificación — Firebase lo manda directamente
+        // Email de verificación: link de Firebase enviado por Brevo.
+        // Marca el cooldown para que un "reenviar" inmediato no duplique el mail.
         try {
+            await emailCooldownOk(email, "verify");
             await sendVerificationEmail(email);
         } catch (emailErr) {
             // No bloqueamos el registro si falla el envío del mail
             console.error("Error enviando email de verificación:", emailErr.message);
         }
-        
-        return res.status(201).send({ message: `User created successfully! 🟢` })
+
+        return res.status(201).send(genericCreated)
     } catch (error) {
-        if (error.code === 'auth/email-already-exists') {
-            return res.status(409).json({ 
-                message: "This email is already registered! 🔴" 
-            });
-        }
         console.error(esProduccion ? `Error creating user! 🔴` : `Error creating user! 🔴 ${error}`);
         res.status(500).send({ message: `Error creating user! 🔴` })
     }
@@ -408,23 +530,44 @@ authRouter.post("/register", async (req, res) => {
 
 // ─── POST /login ──────────────────────────────────────────────────────────────
 authRouter.post("/login", loginLimiter, async (req, res) => {
-    const { email, password, acceptedLegal, adminPin } = req.body || {};
+    const { password, acceptedLegal, adminPin } = req.body || {};
+    const rawEmail = req.body?.email;
 
     // Tipos estrictos: un objeto en email terminaría como filtro de Mongo en la auditoría
-    if (typeof email !== "string" || typeof password !== "string" || !email || !password
-        || email.length > 254 || password.length > 128) {
+    if (typeof rawEmail !== "string" || typeof password !== "string" || !rawEmail || !password
+        || rawEmail.length > 254 || password.length > 128) {
+        return res.status(400).json({ code: "auth/invalid-input", message: "Email y contraseña son requeridos." });
+    }
+
+    const email      = normalizeEmail(rawEmail);
+    const failFilter = { email, event: "login-failed" };
+
+    // Formato inválido → 400 antes de tocar Firebase (si no, INVALID_EMAIL daba 500).
+    // Validar el formato no revela si la cuenta existe.
+    if (!isValidEmail(email)) {
         return res.status(400).json({ code: "auth/invalid-input", message: "Email y contraseña son requeridos." });
     }
 
     try {
-        // 0. Verificar que el email existe antes de intentar autenticar
-        // Así evitamos que mails inexistentes acumulen intentos y queden baneados
-        const exists = await emailExistsInFirebase(email);
-        if (!exists) {
-            return res.status(404).json({
-                code: "auth/user-not-found",
-                message: "No existe ninguna cuenta registrada con ese email.",
-            });
+        // 0. Bloqueo temporal por email (H-02). Se aplica exista o no la cuenta,
+        // así el bloqueo tampoco sirve para averiguar qué emails están registrados.
+        // Si el último intento fue hace más de 15 min, el contador vuelve a cero.
+        const now = new Date();
+        await Audit.updateOne(
+            { ...failFilter, lastAttemptAt: { $lt: new Date(now.getTime() - LOGIN_LOCK_MS) } },
+            { $set: { attempts: 0 } }
+        );
+
+        // El intento se reserva ANTES de validar y de forma atómica (como el PIN):
+        // 100 pedidos en paralelo no consiguen 100 intentos.
+        const attempt = await Audit.findOneAndUpdate(
+            failFilter,
+            { $inc: { attempts: 1 }, $set: { lastAttemptAt: now } },
+            { upsert: true, returnDocument: "after" }
+        );
+
+        if (attempt.attempts > LOGIN_MAX_ATTEMPTS) {
+            return res.status(429).json(LOGIN_LOCKED);
         }
 
         // 1. Validar credenciales contra la API de Firebase Auth
@@ -435,6 +578,11 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
         );
 
         const { idToken, localId: uid } = firebaseResponse.data;
+
+        // Contraseña correcta → contador a cero. Va acá y no al final porque los
+        // pasos siguientes (PIN, legales, email sin verificar) cortan antes y no
+        // tienen que sumar intentos a quien sí sabe la contraseña.
+        await Audit.updateOne(failFilter, { $set: { attempts: 0, lastAttemptAt: null } });
 
         // 2. Verificar el token obtenido y obtener claims
         const decoded = await auth.verifyIdToken(idToken);
@@ -500,12 +648,7 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
             });
         }
 
-        // 5. Limpiar intentos fallidos y auditar login exitoso
-        await Audit.findOneAndUpdate(
-            { email: decoded.email, event: "login-failed" },
-            { $set: { attempts: 0, lastAttemptAt: null } }
-        );
-
+        // 5. Auditar login exitoso (el contador ya se limpió en el paso 1)
         await Audit.create({
             uid: uid,
             email: decoded.email,
@@ -585,92 +728,53 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
     } catch (error) {
         const errorData = error.response?.data?.error?.message;
         const errorCode = errorData ? errorData.split(' ')[0] : null;
-        const now = Date.now();
 
-        console.log("DEBUG // Error detectado:", errorCode);
-
-        const loginErrors = ["INVALID_PASSWORD", "EMAIL_NOT_FOUND", "INVALID_LOGIN_CREDENTIALS"];
-
+        // Email inexistente, contraseña incorrecta o cuenta deshabilitada:
+        // MISMO status, MISMO código, MISMO mensaje y sin contador (H-02).
+        // El intento ya quedó sumado en el paso 0.
+        const loginErrors = ["INVALID_PASSWORD", "EMAIL_NOT_FOUND", "INVALID_LOGIN_CREDENTIALS", "USER_DISABLED", "INVALID_EMAIL"];
         if (loginErrors.includes(errorCode)) {
-            try {
-                const userEmail = req.body.email;
-
-                const attempt = await Audit.findOneAndUpdate(
-                    { email: userEmail, event: "login-failed" },
-                    { 
-                        $inc: { attempts: 1 }, 
-                        $set: { lastAttemptAt: now } 
-                    },
-                    { upsert: true, returnDocument: 'after' }
-                );
-
-                if (attempt.attempts >= 5) {
-                    try {
-                        const userRecord = await auth.getUserByEmail(userEmail);
-                        // Merge con las claims existentes: setCustomUserClaims
-                        // REEMPLAZA todo el objeto (borraría admin, purchases, etc.)
-                        await auth.setCustomUserClaims(userRecord.uid, {
-                            ...(userRecord.customClaims || {}),
-                            banned: true,
-                            bannedAt: now,
-                            bannedReason: "Too many failed login attempts"
-                        });
-                        await auth.revokeRefreshTokens(userRecord.uid);
-                        
-                        return res.status(401).json({ 
-                            code: "auth/too-many-attempts", 
-                            banned: true 
-                        });
-                    } catch (getUserError) {
-                        return res.status(401).json({ 
-                            code: "auth/invalid-credential", 
-                            attempts: attempt.attempts 
-                        });
-                    }
-                }
-
-                return res.status(401).json({ 
-                    code: "auth/invalid-credential", 
-                    attempts: attempt.attempts 
-                });
-
-            } catch (dbError) {
-                console.error("DB_AUDIT_CRITICAL_ERROR 🔴", dbError);
-                return res.status(401).json({ code: "auth/invalid-credential" });
-            }
+            return res.status(401).json(LOGIN_INVALID);
         }
-        
+
+        // Firebase también frena por su cuenta cuando detecta fuerza bruta
+        if (errorCode === "TOO_MANY_ATTEMPTS_TRY_LATER") {
+            return res.status(429).json(LOGIN_LOCKED);
+        }
+
         console.error("SYSTEM_LOGIN_ERROR 🔴", errorCode || error.message);
         return res.status(500).json({ message: "Internal Server Error" });
     }
 })
 
 // ─── POST /resend-verification ────────────────────────────────────────────────
-// Rate limit: sin esto cualquiera puede disparar mails de Brevo en loop
-authRouter.post("/resend-verification", loginLimiter, async (req, res) => {
-    const { email } = req.body;
+// Rate limit por IP + cooldown por email: sin esto cualquiera puede disparar
+// mails de Brevo en loop. Respuesta única: no revela si la cuenta existe ni si
+// ya está verificada (antes daba 404 / 400 distintos = oráculo).
+authRouter.post("/resend-verification", loginLimiter, emailLimiter, async (req, res) => {
+    const email = normalizeEmail(req.body?.email);
 
-    if (!email) {
-        return res.status(400).json({ message: "Email es requerido." });
+    if (!isValidEmail(email)) {
+        return res.status(400).json({ code: "auth/invalid-email", message: "Email inválido." });
     }
+
+    const genericOk = { message: "Si la cuenta existe y no está verificada, te reenviamos el email. 🟢" };
 
     try {
         const userRecord = await auth.getUserByEmail(email);
+        const canSend = !userRecord.emailVerified
+            && !userRecord.disabled
+            && userRecord.customClaims?.banned !== true;
 
-        if (userRecord.emailVerified) {
-            return res.status(400).json({ 
-                code:    "auth/already-verified",
-                message: "Este email ya está verificado." 
-            });
+        if (canSend && await emailCooldownOk(email, "verify")) {
+            sendInBackground(sendVerificationEmail(email), "Error reenviando verificación");
         }
 
-        await sendVerificationEmail(email);
-
-        return res.status(200).json({ message: "Email de verificación reenviado. 🟢" });
+        return res.status(200).json(genericOk);
 
     } catch (error) {
         if (error.code === "auth/user-not-found") {
-            return res.status(404).json({ message: "No existe una cuenta con ese email." });
+            return res.status(200).json(genericOk);
         }
         console.error("Error reenviando verificación:", error.message);
         return res.status(500).json({ message: "Error al reenviar el email." });
@@ -752,10 +856,14 @@ authRouter.post("/unban-user", adminMiddleware, async (req, res) => {
         const { banned, bannedAt, bannedReason, ...restClaims } = user.customClaims || {};
         await auth.setCustomUserClaims(uid, { ...restClaims, banned: false })
         await auth.revokeRefreshTokens(uid)
-        await Audit.findOneAndUpdate(
-            { uid, event: "login-failed" },
-            { $set: { attempts: 0, lastAttemptAt: null } }
-        )
+        // El contador de login está guardado por email (no por uid): antes este
+        // filtro nunca encontraba nada. Ahora el desbaneo también levanta el bloqueo.
+        if (user.email) {
+            await Audit.updateOne(
+                { email: normalizeEmail(user.email), event: "login-failed" },
+                { $set: { attempts: 0, lastAttemptAt: null } }
+            )
+        }
         await Audit.create({
             uid,
             email: user.email,
@@ -999,10 +1107,10 @@ authRouter.post("/security/verify-enterprise-access", verifyToken, verifyZoneAcc
 
 authRouter.post("/security/verify-partner-access", verifyToken, verifyZoneAccess("partner"));
 
-authRouter.post("/reset-password", loginLimiter, async (req, res) => {
-    const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
- 
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+authRouter.post("/reset-password", loginLimiter, emailLimiter, async (req, res) => {
+    const email = normalizeEmail(req.body?.email);
+
+    if (!isValidEmail(email)) {
         return res.status(400).json({ code: "auth/invalid-email", message: "Invalid email" });
     }
  
@@ -1016,7 +1124,11 @@ authRouter.post("/reset-password", loginLimiter, async (req, res) => {
             return res.status(200).json(genericOk);
         }
  
-        await sendPasswordResetEmailBrevo(email);
+        // Cooldown por destinatario + envío sin await (mismo tiempo de respuesta
+        // exista o no la cuenta)
+        if (await emailCooldownOk(email, "reset")) {
+            sendInBackground(sendPasswordResetEmailBrevo(email), "Error sending password reset");
+        }
         return res.status(200).json(genericOk);
     } catch (error) {
         if (error?.code === "auth/user-not-found") {
